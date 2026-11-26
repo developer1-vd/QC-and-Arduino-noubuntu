@@ -32,23 +32,35 @@ jobs:
 
   windows:
     name: Windows app (${{ matrix.arch }})
-    runs-on: windows-latest
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
     strategy:
+      fail-fast: false
       matrix:
-        arch: [x64, arm64]
+        include:
+          - arch: x64
+            runner: windows-latest
+          - arch: arm64
+            runner: windows-11-arm
+    env:
+      PUBLISH: ${{ github.workspace }}\windows\publish\win-${{ matrix.arch }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-dotnet@v4
         with:
           dotnet-version: 10.0.x
       - name: Core tests
-        if: matrix.arch == 'x64'
         run: dotnet test windows/tests/VFlasher.Core.Tests
       - name: Publish vflasher.exe
         run: dotnet publish windows/src/VFlasher -c Release -r win-${{ matrix.arch }} -o windows/publish/win-${{ matrix.arch }}
       - name: Fetch qdl and the EDL USB driver
         shell: pwsh
         run: windows/installer/fetch-edl-tools.ps1 -Dest windows/publish/win-${{ matrix.arch }}
+      - name: Windows integration tests (virtual disks, driver, qdl, app UI)
+        env:
+          VFLASHER_EDL_TOOLS: ${{ env.PUBLISH }}
+          VFLASHER_EXE: ${{ env.PUBLISH }}\vflasher.exe
+        run: dotnet test windows/tests/VFlasher.Windows.Tests --logger "console;verbosity=detailed"
       - name: Build installer
         shell: pwsh
         run: |

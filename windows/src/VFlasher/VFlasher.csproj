@@ -28,6 +28,7 @@
 
   <ItemGroup>
     <ProjectReference Include="..\VFlasher.Core\VFlasher.Core.csproj" />
+    <InternalsVisibleTo Include="VFlasher.Windows.Tests" />
   </ItemGroup>
 
 </Project>
