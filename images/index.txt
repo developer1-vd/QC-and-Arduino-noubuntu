@@ -1,0 +1,2 @@
+# One manufacturer/board/os per line. Keep in sync with the folders below.
+qualcomm/iq9075-evk/fedora
