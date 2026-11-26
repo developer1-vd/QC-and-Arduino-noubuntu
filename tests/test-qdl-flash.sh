@@ -183,6 +183,9 @@ grep -q 'grow-root' "$t/out.txt" || bad "first-boot hint not shown"
 [ "$(grep -c '^read' "$t/qdl.log")" = 1 ] && [ "$(tail -1 "$t/qdl.log")" = 'write 0/0 gpt-main.bin' ] \
     || bad "unexpected qdl commands: $(cat "$t/qdl.log")"
 ok "qdl: one table read, primary GPT written last"
+if [ -n "${REAL_QDL:-}" ]; then
+    ok "every qdl job was also accepted by the real qdl ($REAL_QDL --dry-run)"
+fi
 
 # Flashing again over the result (re-install) gives the same layout.
 layout_before="$(sgdisk -p "$t/emmc.img" | awk '/^ *[0-9]/ { print $2, $3, $6, $7 }')"

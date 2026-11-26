@@ -205,34 +205,34 @@ public class EdlTests(ITestOutputHelper output)
     }
 
     /// <summary>
-    /// The shipped qdl.exe runs (a 32-bit x86 build, emulated on Arm) and accepts
-    /// the exact read and write commands QdlFlashJob sends, in --dry-run mode.
+    /// The shipped qdl.exe (a 32-bit x86 build, emulated on Arm) accepts the
+    /// exact job files QdlFlashJob writes and runs them in --dry-run mode.
     /// </summary>
     [Fact]
-    public async Task QdlAcceptsVFlasherCommands()
+    public async Task QdlRunsVFlasherJobs()
     {
         if (Tools == null)
             return;
         var qdl = new ProcessQdlRunner(Path.Combine(Tools, "qdl", "qdl.exe"));
         var dir = Directory.CreateTempSubdirectory("vflasher-qdl-").FullName;
-        var prog = Path.Combine(dir, "prog_firehose_ddr.elf");
-        File.WriteAllBytes(prog, RandomNumberGenerator.GetBytes(4096));
+        File.WriteAllBytes(Path.Combine(dir, "prog_firehose_ddr.elf"), RandomNumberGenerator.GetBytes(4096));
         foreach (var f in new[] { "p1.img", "p2.img", "p3.img", "gpt-backup.bin", "gpt-main.bin" })
-            File.WriteAllBytes(Path.Combine(dir, f), new byte[64 * 512]);
+            File.WriteAllBytes(Path.Combine(dir, f), RandomNumberGenerator.GetBytes(64 * 512 + 100));
+        QdlJobXml.WriteReadJob(Path.Combine(dir, "read-gpt.xml"), "board-gpt.bin", 0, 34);
+        QdlJobXml.WriteProgramJob(Path.Combine(dir, "rawprogram.xml"), [
+            new("efi", "p1.img", 6031360),
+            new("boot", "p2.img", 7141376),
+            new("system", "p3.img", 11237376),
+            new("BackupGPT", "gpt-backup.bin", 122142701),
+            new("PrimaryGPT", "gpt-main.bin", 0),
+        ]);
+        output.WriteLine(File.ReadAllText(Path.Combine(dir, "rawprogram.xml")));
+
         var lines = new List<string>();
         using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(60));
-
-        // Exactly what QdlFlashJob runs: bare names inside the work folder.
-        string[] Common() => ["--dry-run", "--storage", "emmc", "prog_firehose_ddr.elf"];
-        var read = await qdl.RunAsync([.. Common(), "read", "0/0+34", "board-gpt.bin"], dir, lines.Add, cts.Token);
-        var write = await qdl.RunAsync([
-            .. Common(),
-            "write", "0/6031360", "p1.img",
-            "write", "0/7141376", "p2.img",
-            "write", "0/11237376", "p3.img",
-            "write", "0/122142701", "gpt-backup.bin",
-            "write", "0/0", "gpt-main.bin",
-        ], dir, lines.Add, cts.Token);
+        string[] common = ["--dry-run", "--storage", "emmc", "prog_firehose_ddr.elf"];
+        var read = await qdl.RunAsync([.. common, "read-gpt.xml"], dir, lines.Add, cts.Token);
+        var write = await qdl.RunAsync([.. common, "rawprogram.xml"], dir, lines.Add, cts.Token);
         foreach (var l in lines)
             output.WriteLine(l);
         Directory.Delete(dir, true);

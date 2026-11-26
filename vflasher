@@ -536,11 +536,27 @@ add_devicetree_to_esp() {
     [ "$found" -eq 1 ] || die "no GRUB stub found on the image's EFI partition"
 }
 
+# qdl job files (Qualcomm rawprogram*.xml format), as Arduino's flasher uses.
+# They state the sector size, so qdl need not detect it. The C# app writes the
+# same files (windows/src/VFlasher.Core/Qdl/QdlJobXml.cs).
+qdl_read_job() { # FILE START SECTORS
+    printf '<?xml version="1.0" ?>\n<data>\n  <read SECTOR_SIZE_IN_BYTES="512" filename="%s" physical_partition_number="0" num_partition_sectors="%s" start_sector="%s"/>\n</data>\n' "$1" "$3" "$2"
+}
+
+qdl_program_line() { # DIR LABEL FILE START
+    local sectors=$(( ($(stat -c %s "$1/$3") + 511) / 512 ))
+    printf '  <program SECTOR_SIZE_IN_BYTES="512" file_sector_offset="0" filename="%s" label="%s" num_partition_sectors="%s" physical_partition_number="0" sparse="false" start_sector="%s"/>\n' "$3" "$2" "$sectors" "$4"
+}
+
 flash_qdl() {
     local image="$1" assume_yes="$2"
     local storage="${CONF[QDL_STORAGE]:-emmc}" esp_name="${CONF[QDL_ESP_PARTITION]:-efi}"
     local root_name="${CONF[QDL_ROOT_PARTITION]:-system}"
-    need python3; need awk
+    local n
+    for n in "$storage" "$esp_name" "$root_name"; do
+        [[ $n =~ ^[A-Za-z0-9_.-]+$ ]] || die "invalid partition or storage name '$n' in manifest"
+    done
+    need python3; need awk; need stat
     [ "$QDL" != qdl ] || need qdl
     [ "${VFLASHER_TEST:-}" = 1 ] || [ -d /sys/bus/usb/devices ] || die "cannot see USB devices (/sys/bus/usb)"
 
@@ -579,7 +595,8 @@ flash_qdl() {
     wait_for_edl
 
     info "Reading the board's partition table"
-    "$QDL" --storage "$storage" "$prog" read 0/0+34 "$work/board-gpt.bin" \
+    qdl_read_job board-gpt.bin 0 34 > "$work/read-gpt.xml"
+    (cd "$work" && "$QDL" --storage "$storage" "$prog" read-gpt.xml) \
         || die "qdl could not read the board (is it in EDL mode?)"
 
     local -A plan=()
@@ -605,12 +622,17 @@ flash_qdl() {
     # mode while the EDL jumper is still fitted.
     wait_for_edl
     info "Flashing (this takes a while; do not disconnect the board)"
-    "$QDL" --storage "$storage" "$prog" \
-        write "0/${plan[ESP_START]}" "$work/p1.img" \
-        write "0/${plan[BOOT_START]}" "$work/p2.img" \
-        write "0/${plan[ROOT_START]}" "$work/p3.img" \
-        write "0/${plan[BACKUP_START]}" "$work/gpt-backup.bin" \
-        write 0/0 "$work/gpt-main.bin" \
+    # The partitions first, the new partition table last.
+    {
+        printf '<?xml version="1.0" ?>\n<data>\n'
+        qdl_program_line "$work" "$esp_name" p1.img "${plan[ESP_START]}"
+        qdl_program_line "$work" boot p2.img "${plan[BOOT_START]}"
+        qdl_program_line "$work" "$root_name" p3.img "${plan[ROOT_START]}"
+        qdl_program_line "$work" BackupGPT gpt-backup.bin "${plan[BACKUP_START]}"
+        qdl_program_line "$work" PrimaryGPT gpt-main.bin 0
+        printf '</data>\n'
+    } > "$work/rawprogram.xml"
+    (cd "$work" && "$QDL" --storage "$storage" "$prog" rawprogram.xml) \
         || die "qdl failed while flashing; re-run VFlasher, or restore the vendor image with its own flasher"
 
     info "Done. ${CONF[NAME]} is on the board."

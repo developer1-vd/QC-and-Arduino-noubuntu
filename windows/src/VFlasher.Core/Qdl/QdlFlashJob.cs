@@ -131,7 +131,8 @@ public sealed class QdlFlashJob(
             File.Copy(programmer, Path.Combine(work, Programmer));
             ui.Log("Reading the board's partition table…");
             var boardGpt = Path.Combine(work, "board-gpt.bin");
-            await RunQdlAsync(work, [.. Common(storage), "read", "0/0+34", "board-gpt.bin"],
+            QdlJobXml.WriteReadJob(Path.Combine(work, "read-gpt.xml"), "board-gpt.bin", 0, 34);
+            await RunQdlAsync(work, [.. Common(storage), "read-gpt.xml"],
                 "qdl could not read the board (is it in EDL mode?)", ct);
 
             var plan = GptPlanner.Plan(await File.ReadAllBytesAsync(boardGpt, ct), espName, rootName,
@@ -151,14 +152,16 @@ public sealed class QdlFlashJob(
 
             ui.Log("Flashing (this takes a while; do not disconnect the board)…");
             progress.Report(new TransferProgress("Flashing", 0, null));
-            await RunQdlAsync(work, [
-                .. Common(storage),
-                "write", $"0/{plan.EspStart}", Path.GetFileName(parts[0].Path),
-                "write", $"0/{plan.BootStart}", Path.GetFileName(parts[1].Path),
-                "write", $"0/{plan.RootStart}", Path.GetFileName(parts[2].Path),
-                "write", $"0/{plan.BackupStart}", Path.GetFileName(backup),
-                "write", "0/0", Path.GetFileName(main),
-            ], "qdl failed while flashing; try again, or restore the vendor image with its own flasher", ct);
+            // The partitions first, the new partition table last.
+            QdlJobXml.WriteProgramJob(Path.Combine(work, "rawprogram.xml"), [
+                new(espName, Path.GetFileName(parts[0].Path), plan.EspStart),
+                new("boot", Path.GetFileName(parts[1].Path), plan.BootStart),
+                new(rootName, Path.GetFileName(parts[2].Path), plan.RootStart),
+                new("BackupGPT", Path.GetFileName(backup), plan.BackupStart),
+                new("PrimaryGPT", Path.GetFileName(main), 0),
+            ]);
+            await RunQdlAsync(work, [.. Common(storage), "rawprogram.xml"],
+                "qdl failed while flashing; try again, or restore the vendor image with its own flasher", ct);
 
             ui.Log($"Done. {m.Name} is on the board.");
             ui.Log("Remove the EDL jumper and power-cycle the board.");

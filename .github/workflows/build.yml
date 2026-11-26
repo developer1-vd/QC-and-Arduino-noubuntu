@@ -22,12 +22,20 @@ jobs:
           bash -n vflasher
           shellcheck vflasher tests/fake-qdl tests/test-qdl-flash.sh
           ./vflasher --list
-      - name: EDL/qdl flashing test (fake board)
+      - name: Get the real qdl v2.4 (Linux build of the version VFlasher ships)
+        run: |
+          curl -fsSL -o /tmp/qdl.tar.gz https://github.com/arduino/qdl-packing/releases/download/v2.4-26/qdl_v2.4-26_Linux_64bit.tar.gz
+          echo "96fd6dead243aa4e9c00534f712657dd2e0b935868551e11e0beec1603ac8c43  /tmp/qdl.tar.gz" | sha256sum -c
+          mkdir -p /tmp/qdl && tar -xzf /tmp/qdl.tar.gz -C /tmp/qdl qdl
+          echo "REAL_QDL=/tmp/qdl/qdl" >> "$GITHUB_ENV"
+      # With REAL_QDL set, tests/fake-qdl passes every qdl job to the real qdl
+      # (--dry-run) before applying it to the fake eMMC.
+      - name: EDL/qdl flashing test (fake board, jobs checked by real qdl)
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq gdisk mtools zstd
           tests/test-qdl-flash.sh
-      - name: Core tests
+      - name: Core tests (C# EDL job checked by real qdl too)
         run: dotnet test windows/tests/VFlasher.Core.Tests
 
   windows:
