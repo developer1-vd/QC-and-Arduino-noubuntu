@@ -2,10 +2,15 @@ using System.Diagnostics;
 
 namespace VFlasher.Core.Qdl;
 
-/// <summary>Runs qdl with the given arguments, passing each output line to <c>onOutput</c>.</summary>
+/// <summary>
+/// Runs qdl with the given arguments in <c>workingDirectory</c>, passing each
+/// output line to <c>onOutput</c>. File arguments should be bare names inside
+/// that folder: qdl reads "C:\..." as a programmer image id ("C").
+/// </summary>
 public interface IQdlRunner
 {
-    Task<int> RunAsync(IReadOnlyList<string> args, Action<string> onOutput, CancellationToken ct);
+    Task<int> RunAsync(IReadOnlyList<string> args, string workingDirectory, Action<string> onOutput,
+        CancellationToken ct);
 }
 
 /// <summary>Knows when a board in Qualcomm EDL mode (USB 05c6:9008) is connected.</summary>
@@ -33,10 +38,12 @@ public interface IQdlUserInterface
 public sealed class ProcessQdlRunner(string executable, IReadOnlyDictionary<string, string>? environment = null)
     : IQdlRunner
 {
-    public async Task<int> RunAsync(IReadOnlyList<string> args, Action<string> onOutput, CancellationToken ct)
+    public async Task<int> RunAsync(IReadOnlyList<string> args, string workingDirectory, Action<string> onOutput,
+        CancellationToken ct)
     {
         var psi = new ProcessStartInfo(executable)
         {
+            WorkingDirectory = workingDirectory,
             RedirectStandardOutput = true,
             RedirectStandardError = true,
             UseShellExecute = false,
@@ -120,9 +127,11 @@ public sealed class QdlFlashJob(
             progress.Report(new TransferProgress("Waiting for the board in EDL mode", 0, null));
             await edl.WaitForDeviceAsync(ct);
 
+            // qdl runs in the work folder with bare file names, like Arduino's flasher.
+            File.Copy(programmer, Path.Combine(work, Programmer));
             ui.Log("Reading the board's partition table…");
             var boardGpt = Path.Combine(work, "board-gpt.bin");
-            await RunQdlAsync([.. Common(storage, programmer), "read", "0/0+34", boardGpt],
+            await RunQdlAsync(work, [.. Common(storage), "read", "0/0+34", "board-gpt.bin"],
                 "qdl could not read the board (is it in EDL mode?)", ct);
 
             var plan = GptPlanner.Plan(await File.ReadAllBytesAsync(boardGpt, ct), espName, rootName,
@@ -142,13 +151,13 @@ public sealed class QdlFlashJob(
 
             ui.Log("Flashing (this takes a while; do not disconnect the board)…");
             progress.Report(new TransferProgress("Flashing", 0, null));
-            await RunQdlAsync([
-                .. Common(storage, programmer),
-                "write", $"0/{plan.EspStart}", parts[0].Path,
-                "write", $"0/{plan.BootStart}", parts[1].Path,
-                "write", $"0/{plan.RootStart}", parts[2].Path,
-                "write", $"0/{plan.BackupStart}", backup,
-                "write", "0/0", main,
+            await RunQdlAsync(work, [
+                .. Common(storage),
+                "write", $"0/{plan.EspStart}", Path.GetFileName(parts[0].Path),
+                "write", $"0/{plan.BootStart}", Path.GetFileName(parts[1].Path),
+                "write", $"0/{plan.RootStart}", Path.GetFileName(parts[2].Path),
+                "write", $"0/{plan.BackupStart}", Path.GetFileName(backup),
+                "write", "0/0", Path.GetFileName(main),
             ], "qdl failed while flashing; try again, or restore the vendor image with its own flasher", ct);
 
             ui.Log($"Done. {m.Name} is on the board.");
@@ -162,11 +171,13 @@ public sealed class QdlFlashJob(
         }
     }
 
-    static string[] Common(string storage, string programmer) => ["--storage", storage, programmer];
+    const string Programmer = "prog_firehose_ddr.elf";
 
-    async Task RunQdlAsync(string[] args, string error, CancellationToken ct)
+    static string[] Common(string storage) => ["--storage", storage, Programmer];
+
+    async Task RunQdlAsync(string workDir, string[] args, string error, CancellationToken ct)
     {
-        var code = await qdl.RunAsync(args, ui.Log, ct);
+        var code = await qdl.RunAsync(args, workDir, ui.Log, ct);
         if (code != 0)
             throw new IOException($"{error} (qdl exit code {code})");
     }

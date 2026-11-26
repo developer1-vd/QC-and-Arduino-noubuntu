@@ -209,6 +209,18 @@ public class QdlFlashJobTests : IDisposable
 
     public void Dispose() => Directory.Delete(dir, true);
 
+    /// <summary>Records qdl arguments (qdl.exe reads "C:\..." as an image id, so only bare names are allowed).</summary>
+    sealed class RecordingQdl(IQdlRunner inner) : IQdlRunner
+    {
+        public List<string> Args { get; } = [];
+        public Task<int> RunAsync(IReadOnlyList<string> args, string workingDirectory, Action<string> onOutput,
+            CancellationToken ct)
+        {
+            Args.AddRange(args);
+            return inner.RunAsync(args, workingDirectory, onOutput, ct);
+        }
+    }
+
     sealed class NoWaitEdl : IEdlDevice
     {
         public Task WaitForDeviceAsync(CancellationToken ct) => Task.CompletedTask;
@@ -265,8 +277,8 @@ public class QdlFlashJobTests : IDisposable
         var firmwareBefore = Region(34, 16384 - 34);
         var persistBefore = Region(49152, 4096);
 
-        var qdl = new ProcessQdlRunner(Path.Combine(RepoRoot(), "tests", "fake-qdl"),
-            new Dictionary<string, string> { ["FAKE_QDL_DISK"] = emmc });
+        var qdl = new RecordingQdl(new ProcessQdlRunner(Path.Combine(RepoRoot(), "tests", "fake-qdl"),
+            new Dictionary<string, string> { ["FAKE_QDL_DISK"] = emmc }));
         var ui = new AutoYes();
         var http = new HttpClient(new QdlPieceTests.StaticServer(imageZst, archive));
         var job = new QdlFlashJob(m, http, Path.Combine(dir, "cache"), qdl, new NoWaitEdl(), ui);
@@ -282,6 +294,8 @@ public class QdlFlashJobTests : IDisposable
         var esp = Region(plan.EspStart, (8 << 20) / S);
         Assert.Contains("devicetree ($root)/dtb/qcom/test-board.dtb", ReadFatFile(esp, @"\EFI\fedora\grub.cfg"));
         Assert.Contains(ui.Lines, l => l.StartsWith("Done."));
+        Assert.All(qdl.Args, a => Assert.False(Path.IsPathRooted(a) || a.Contains(':'), $"qdl argument '{a}' is a full path"));
+        Assert.Contains("prog_firehose_ddr.elf", qdl.Args);
 
         if (HasTool("sgdisk"))
         {

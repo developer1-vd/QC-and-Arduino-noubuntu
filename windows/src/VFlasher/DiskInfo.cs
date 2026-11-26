@@ -47,14 +47,26 @@ internal sealed record DiskInfo(int Number, string Model, long Size, string Bus,
             {
                 if (h.IsInvalid)
                     continue;
-                var length = Native.Ioctl(h, Native.IOCTL_DISK_GET_LENGTH_INFO, null, 8);
-                var size = length is { Length: 8 } ? BitConverter.ToInt64(length) : 0;
+                var size = DiskSize(h);
                 var (model, bus, removable) = QueryDevice(h);
                 disks.Add(new DiskInfo(n, model, size, bus, removable, systemDisks.Contains(n),
                     mounts.GetValueOrDefault(n) ?? []));
             }
         }
         return disks;
+    }
+
+    /// <summary>
+    /// Size in bytes. GET_LENGTH_INFO needs read access, which this handle does
+    /// not have; GET_DRIVE_GEOMETRY_EX works without it (DiskSize is at offset 24).
+    /// </summary>
+    static long DiskSize(Microsoft.Win32.SafeHandles.SafeFileHandle h)
+    {
+        if (Native.Ioctl(h, Native.IOCTL_DISK_GET_LENGTH_INFO, null, 8) is { Length: 8 } len)
+            return BitConverter.ToInt64(len);
+        if (Native.Ioctl(h, Native.IOCTL_DISK_GET_DRIVE_GEOMETRY_EX, null, 256) is { Length: >= 32 } geo)
+            return BitConverter.ToInt64(geo, 24);
+        return 0;
     }
 
     static (string Model, string Bus, bool Removable) QueryDevice(Microsoft.Win32.SafeHandles.SafeFileHandle h)

@@ -222,16 +222,17 @@ public class EdlTests(ITestOutputHelper output)
         var lines = new List<string>();
         using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(60));
 
-        string[] Common() => ["--dry-run", "--storage", "emmc", prog];
-        var read = await qdl.RunAsync([.. Common(), "read", "0/0+34", Path.Combine(dir, "board-gpt.bin")], lines.Add, cts.Token);
+        // Exactly what QdlFlashJob runs: bare names inside the work folder.
+        string[] Common() => ["--dry-run", "--storage", "emmc", "prog_firehose_ddr.elf"];
+        var read = await qdl.RunAsync([.. Common(), "read", "0/0+34", "board-gpt.bin"], dir, lines.Add, cts.Token);
         var write = await qdl.RunAsync([
             .. Common(),
-            "write", "0/6031360", Path.Combine(dir, "p1.img"),
-            "write", "0/7141376", Path.Combine(dir, "p2.img"),
-            "write", "0/11237376", Path.Combine(dir, "p3.img"),
-            "write", "0/122142701", Path.Combine(dir, "gpt-backup.bin"),
-            "write", "0/0", Path.Combine(dir, "gpt-main.bin"),
-        ], lines.Add, cts.Token);
+            "write", "0/6031360", "p1.img",
+            "write", "0/7141376", "p2.img",
+            "write", "0/11237376", "p3.img",
+            "write", "0/122142701", "gpt-backup.bin",
+            "write", "0/0", "gpt-main.bin",
+        ], dir, lines.Add, cts.Token);
         foreach (var l in lines)
             output.WriteLine(l);
         Directory.Delete(dir, true);
