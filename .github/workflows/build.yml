@@ -1,0 +1,86 @@
+name: Build
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    name: Linux script and core tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+      - name: Check vflasher script
+        run: |
+          bash -n vflasher
+          shellcheck vflasher tests/fake-qdl tests/test-qdl-flash.sh
+          ./vflasher --list
+      - name: Get the real qdl v2.4 (Linux build of the version VFlasher ships)
+        run: |
+          curl -fsSL -o /tmp/qdl.tar.gz https://github.com/arduino/qdl-packing/releases/download/v2.4-26/qdl_v2.4-26_Linux_64bit.tar.gz
+          echo "96fd6dead243aa4e9c00534f712657dd2e0b935868551e11e0beec1603ac8c43  /tmp/qdl.tar.gz" | sha256sum -c
+          mkdir -p /tmp/qdl && tar -xzf /tmp/qdl.tar.gz -C /tmp/qdl qdl
+          echo "REAL_QDL=/tmp/qdl/qdl" >> "$GITHUB_ENV"
+      # With REAL_QDL set, tests/fake-qdl passes every qdl job to the real qdl
+      # (--dry-run) before applying it to the fake eMMC.
+      - name: EDL/qdl flashing test (fake board, jobs checked by real qdl)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq gdisk mtools zstd
+          tests/test-qdl-flash.sh
+      - name: Core tests (C# EDL job checked by real qdl too)
+        run: dotnet test windows/tests/VFlasher.Core.Tests
+
+  windows:
+    name: Windows app (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            runner: windows-latest
+          - arch: arm64
+            runner: windows-11-arm
+    env:
+      PUBLISH: ${{ github.workspace }}\windows\publish\win-${{ matrix.arch }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+      - name: Core tests
+        run: dotnet test windows/tests/VFlasher.Core.Tests
+      - name: Publish vflasher.exe
+        run: dotnet publish windows/src/VFlasher -c Release -r win-${{ matrix.arch }} -o windows/publish/win-${{ matrix.arch }}
+      - name: Fetch qdl and the EDL USB driver
+        shell: pwsh
+        run: windows/installer/fetch-edl-tools.ps1 -Dest windows/publish/win-${{ matrix.arch }}
+      - name: Windows integration tests (virtual disks, driver, qdl, app UI)
+        env:
+          VFLASHER_EDL_TOOLS: ${{ env.PUBLISH }}
+          VFLASHER_EXE: ${{ env.PUBLISH }}\vflasher.exe
+        run: dotnet test windows/tests/VFlasher.Windows.Tests --logger "console;verbosity=detailed"
+      - name: Build installer
+        shell: pwsh
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) { choco install innosetup -y --no-progress; }
+          & $iscc /DArch=${{ matrix.arch }} windows\installer\vflasher.iss
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vflasher-windows-${{ matrix.arch }}
+          path: |
+            windows/publish/win-${{ matrix.arch }}/vflasher.exe
+            windows/publish/win-${{ matrix.arch }}/qdl/
+            windows/publish/win-${{ matrix.arch }}/drivers/
+            windows/publish/vflasher-setup-*.exe

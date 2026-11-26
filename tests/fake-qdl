@@ -1,0 +1,90 @@
+#!/usr/bin/env bash
+# Stand-in for qdl, used by the tests: runs qdl's commands against a disk-image
+# file ($FAKE_QDL_DISK) instead of a board. Understands qdl job files
+# (<read>/<program> XML, checked for every attribute qdl v2.4 requires) and the
+# raw "read"/"write" commands.
+#
+# If $REAL_QDL names a real qdl binary, every invocation is first passed to it
+# with --dry-run, so the real qdl's parser and simulated flashing check each
+# job (CI does this with the same qdl v2.4 build that VFlasher ships).
+set -euo pipefail
+disk="${FAKE_QDL_DISK:?FAKE_QDL_DISK must name a disk image}"
+fail() { echo "fake-qdl: $*" >&2; exit 1; }
+
+if [ -n "${REAL_QDL:-}" ]; then
+    "$REAL_QDL" --dry-run "$@" > /dev/null || fail "real qdl --dry-run rejected: $*"
+fi
+
+while [[ ${1:-} == --* ]]; do
+    case "$1" in
+        --storage) [ "$2" = emmc ] || fail "unexpected storage $2"; shift 2 ;;
+        *) shift ;;
+    esac
+done
+prog="$1"; shift
+[ -s "$prog" ] || fail "programmer '$prog' missing"
+
+# Turn the arguments into "read|write ADDRESS FILE" lines.
+ops="$(python3 -I - "$@" <<'PY'
+import os, sys
+import xml.etree.ElementTree as ET
+
+def fail(msg):
+    sys.exit("fake-qdl: " + msg)
+
+args, out = sys.argv[1:], []
+REQUIRED = {
+    "read": ["SECTOR_SIZE_IN_BYTES", "filename", "physical_partition_number", "num_partition_sectors", "start_sector"],
+    "program": ["SECTOR_SIZE_IN_BYTES", "filename", "label", "num_partition_sectors", "physical_partition_number",
+                "sparse", "start_sector", "file_sector_offset"],
+}
+while args:
+    a = args.pop(0)
+    if a in ("read", "write"):
+        if len(args) < 2:
+            fail(f"incomplete command {a}")
+        out.append((a, args.pop(0), args.pop(0)))
+        continue
+    if not a.endswith(".xml"):
+        fail(f"unexpected argument {a}")
+    root = ET.parse(a).getroot()
+    if root.tag != "data":
+        fail(f"{a}: root must be <data>")
+    for el in root:
+        if el.tag not in REQUIRED:
+            fail(f"{a}: unexpected <{el.tag}>")
+        missing = [k for k in REQUIRED[el.tag] if k not in el.attrib]
+        if missing:
+            fail(f"{a}: <{el.tag}> lacks {missing}")
+        at = el.attrib
+        if at["SECTOR_SIZE_IN_BYTES"] != "512" or at["physical_partition_number"] != "0":
+            fail(f"{a}: unexpected sector size or LUN")
+        if el.tag == "read":
+            out.append(("read", f"0/{at['start_sector']}+{at['num_partition_sectors']}", at["filename"]))
+        else:
+            if at["sparse"] != "false" or at["file_sector_offset"] != "0":
+                fail(f"{a}: unexpected sparse/file_sector_offset")
+            size = os.path.getsize(at["filename"])
+            if int(at["num_partition_sectors"]) != (size + 511) // 512:
+                fail(f"{a}: num_partition_sectors does not match {at['filename']}")
+            out.append(("write", f"0/{at['start_sector']}", at["filename"]))
+for op in out:
+    print(*op)
+PY
+)"
+
+while read -r cmd addr file; do
+    [[ $addr =~ ^0/([0-9]+)(\+([0-9]+))?$ ]] || fail "bad address $addr"
+    start="${BASH_REMATCH[1]}" count="${BASH_REMATCH[3]}"
+    case "$cmd" in
+        read)
+            [ -n "$count" ] || fail "read needs N/S+L"
+            dd if="$disk" of="$file" bs=512 skip="$start" count="$count" status=none ;;
+        write)
+            size=$(stat -c %s "$file")
+            [ $((size % 512)) -eq 0 ] || fail "$file is not whole sectors"
+            [ $((start * 512 + size)) -le "$(stat -c %s "$disk")" ] || fail "write past end of disk"
+            dd if="$file" of="$disk" bs=1M oflag=seek_bytes seek=$((start * 512)) conv=notrunc status=none ;;
+    esac
+    echo "$cmd $addr $(basename "$file")" >> "${FAKE_QDL_LOG:-/dev/null}"
+done <<< "$ops"

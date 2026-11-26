@@ -1,0 +1,30 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- Integration tests that need real Windows: run in CI on windows-latest and windows-11-arm.
+       They create virtual disks and install a driver, so they need administrator rights. -->
+  <PropertyGroup>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <IsPackable>false</IsPackable>
+    <UseWindowsForms>true</UseWindowsForms>
+    <UseWPF>true</UseWPF>
+    <EnableWindowsTargeting>true</EnableWindowsTargeting>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="18.11.1" />
+    <PackageReference Include="xunit" Version="2.9.3" />
+    <PackageReference Include="xunit.runner.visualstudio" Version="3.1.5" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Using Include="Xunit" />
+    <!-- UseWPF removes these from the implicit usings -->
+    <Using Include="System.IO" />
+    <Using Include="System.Net.Http" />
+    <ProjectReference Include="..\..\src\VFlasher\VFlasher.csproj" />
+    <Compile Include="..\VFlasher.Core.Tests\QdlFixtures.cs" Link="QdlFixtures.cs" />
+  </ItemGroup>
+
+</Project>
