@@ -40,8 +40,8 @@ resumes where it stopped.
 ## Limits
 
 - Only images with `FLASH_METHOD=dd` (write to a drive) are supported. Boards
-  that must be flashed over USB in Qualcomm EDL mode (`FLASH_METHOD=qdl`) need
-  the Linux `vflasher` for now.
+  that must be flashed over USB in Qualcomm EDL mode (`FLASH_METHOD=qdl`), such
+  as the Arduino VENTUNO Q, are listed but need the Linux `vflasher` for now.
 
 ## Build
 

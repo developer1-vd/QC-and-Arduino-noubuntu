@@ -25,10 +25,12 @@ Usage:
 Examples:
   sudo vflasher qualcomm iq9075-evk fedora
   sudo vflasher qualcomm iq9075-evk fedora --device /dev/sdb
+  sudo vflasher arduino ventuno-q fedora
 
 Options:
   -d, --device DEV    Block device to write (whole disk, e.g. /dev/sdb).
                       If omitted, VFlasher lists drives and asks.
+                      Not used for boards flashed over USB in EDL mode.
   -y, --yes           Do not ask for confirmation before writing.
       --download-only Download and verify the image, but do not flash.
       --info          Show the image details and exit.
@@ -39,6 +41,7 @@ Options:
 Environment:
   VFLASHER_IMAGES     Local images directory (default: next to this script).
   VFLASHER_CACHE      Download cache (default: ~/.cache/vflasher).
+  VFLASHER_QDL        qdl program for EDL flashing (default: qdl).
 EOF
 }
 
@@ -244,6 +247,380 @@ flash_dd() {
     info "Done. $dev now holds ${CONF[NAME]}."
 }
 
+# --------------------------------------------------------- qdl (EDL) flash
+#
+# Boards such as the Arduino VENTUNO Q boot only from on-board eMMC, which is
+# written over USB in Qualcomm EDL mode with qdl. The eMMC starts with dozens
+# of firmware partitions (bootloaders, UEFI, ...) that must not be touched.
+# VFlasher reads the board's own partition table, keeps every firmware
+# partition as it is, and only rearranges the OS partitions at the end:
+#
+#   before:  [firmware ...] [efi] [persist] [system ..................]
+#   after:   [firmware ...] [efi] [persist] [boot] [system ............]
+#
+# The image's EFI, /boot and root partitions go into efi, boot and system.
+
+QDL="${VFLASHER_QDL:-qdl}"
+
+# Partition-table and image helper, run with python3. Subcommands:
+#   split OUTDIR        raw disk image on stdin -> OUTDIR/p1.img ... (sparse);
+#                       prints "pN START SECTORS" per partition
+#   plan GPT ESP ROOT BOOT_SECTORS ESP_MIN ROOT_MIN ROOT_TYPE OUTDIR
+#                       board GPT (34 sectors) -> OUTDIR/gpt-main.bin and
+#                       gpt-backup.bin; prints KEY VALUE lines
+read -r -d '' PY_HELPER <<'PY' || true
+import struct, sys, uuid, zlib
+
+SECTOR = 512
+MIB = 1 << 20
+ESP_TYPE = uuid.UUID("c12a7328-f81f-11d2-ba4b-00a0c93ec93b")
+XBOOTLDR_TYPE = uuid.UUID("bc13c2ff-59e6-4262-a352-b275fd6f7172")
+LVM_TYPE = uuid.UUID("e6d6d379-f507-44c2-a23c-238f2a3df928")
+LINUX_TYPE = uuid.UUID("0fc63daf-8483-4772-8e79-3d69d8477de4")
+HDR = struct.Struct("<8sIIIIQQQQ16sQIII")
+ENT = struct.Struct("<16s16sQQQ72s")
+
+
+def fail(msg):
+    sys.exit("vflasher: error: " + msg)
+
+
+class Reader:
+    """Sequential reader over stdin with a little look-back for the header."""
+
+    def __init__(self, f):
+        self.f, self.pos = f, 0
+
+    def read(self, n):
+        out = bytearray()
+        while len(out) < n:
+            b = self.f.read(n - len(out))
+            if not b:
+                fail("the image ended before its last partition")
+            out += b
+        self.pos += n
+        return bytes(out)
+
+    def skip_to(self, pos):
+        while self.pos < pos:
+            self.read(min(MIB, pos - self.pos))
+
+
+def image_partitions(head):
+    """Partitions (start, sectors) of an MBR or GPT disk image."""
+    if head[510:512] != b"\x55\xaa":
+        fail("the image has no partition table")
+    mbr = [struct.unpack_from("<B3xB3xII", head, 446 + 16 * i) for i in range(4)]
+    if any(t == 0xEE for _, t, _, _ in mbr):
+        h = HDR.unpack_from(head, SECTOR)
+        if h[0] != b"EFI PART":
+            fail("bad GPT in image")
+        parts = []
+        for i in range(h[11]):
+            e = ENT.unpack_from(head, h[10] * SECTOR + i * h[12])
+            if e[0] != bytes(16):
+                parts.append((e[2], e[3] - e[2] + 1))
+        return sorted(parts)
+    return sorted((s, n) for _, t, s, n in mbr if t != 0 and n > 0)
+
+
+def split(outdir):
+    src = Reader(sys.stdin.buffer)
+    head = src.read(MIB)
+    parts = image_partitions(head)
+    zero = bytes(MIB)
+    for i, (start, sectors) in enumerate(parts, 1):
+        if start * SECTOR < src.pos:
+            fail("overlapping partitions in image")
+        src.skip_to(start * SECTOR)
+        length = sectors * SECTOR
+        with open(f"{outdir}/p{i}.img", "wb") as out:
+            left = length
+            while left:
+                b = src.read(min(MIB, left))
+                if b == zero[: len(b)]:
+                    out.seek(len(b), 1)  # leave a hole
+                else:
+                    out.write(b)
+                left -= len(b)
+            out.truncate(length)
+        print(f"p{i} {start} {sectors}")
+
+
+def crc(b):
+    return zlib.crc32(b) & 0xFFFFFFFF
+
+
+def name_of(e):
+    return e[5].decode("utf-16-le").rstrip("\0")
+
+
+def header_bytes(fields):
+    h = bytearray(HDR.pack(*fields))
+    struct.pack_into("<I", h, 16, 0)
+    struct.pack_into("<I", h, 16, crc(h))
+    return bytes(h) + bytes(SECTOR - HDR.size)
+
+
+def plan(gpt_file, esp_name, root_name, boot_sectors, esp_min, root_min, root_type, outdir):
+    boot_sectors, esp_min, root_min = int(boot_sectors), int(esp_min), int(root_min)
+    d = open(gpt_file, "rb").read()
+    if len(d) < 34 * SECTOR:
+        fail("the partition table read from the board is too short")
+    h = list(HDR.unpack_from(d, SECTOR))
+    sig, _, hsize, hcrc, _, my_lba, alt_lba, first, last, _, ent_lba, n, esz, ecrc = h
+    if sig != b"EFI PART" or hsize != 92 or my_lba != 1 or ent_lba != 2 or esz != 128:
+        fail("unexpected partition table on the board (not a standard GPT)")
+    check = bytearray(d[SECTOR:SECTOR + 92])
+    struct.pack_into("<I", check, 16, 0)
+    if crc(check) != hcrc:
+        fail("the board's GPT header checksum is wrong")
+    ent_sectors = (n * esz + SECTOR - 1) // SECTOR
+    if 2 + ent_sectors > 34:
+        fail("the board's GPT has more partition entries than expected")
+    raw = d[ent_lba * SECTOR: ent_lba * SECTOR + n * esz]
+    if crc(raw) != ecrc:
+        fail("the board's GPT entry checksum is wrong")
+    if alt_lba <= last:
+        fail("the board's GPT does not describe the whole eMMC")
+
+    entries = [list(ENT.unpack_from(raw, i * esz)) for i in range(n)]
+    used = [i for i, e in enumerate(entries) if e[0] != bytes(16)]
+    by_name = {}
+    for i in used:
+        by_name.setdefault(name_of(entries[i]), []).append(i)
+
+    def one(name):
+        idx = by_name.get(name, [])
+        if len(idx) != 1:
+            fail(f"expected exactly one '{name}' partition on the board, found {len(idx)}")
+        return idx[0]
+
+    esp, root = one(esp_name), one(root_name)
+    rstart = entries[root][2]
+    # A board flashed by VFlasher before has [boot][system] at the end: treat
+    # both as the OS area again, so re-flashing gives the same layout.
+    if "boot" in by_name:
+        b = one("boot")
+        later = [i for i in used if i not in (b, root) and entries[i][3] >= entries[b][2]]
+        if (uuid.UUID(bytes_le=entries[b][0]) != XBOOTLDR_TYPE or entries[b][3] >= rstart or later):
+            fail("the board has a 'boot' partition that VFlasher did not create; not changing it")
+        rstart = entries[b][2]
+        entries[b] = [bytes(16), bytes(16), 0, 0, 0, bytes(72)]
+        used.remove(b)
+    if uuid.UUID(bytes_le=entries[esp][0]) != ESP_TYPE:
+        fail(f"'{esp_name}' is not an EFI system partition")
+    esp_size = entries[esp][3] - entries[esp][2] + 1
+    if esp_size < esp_min:
+        fail(f"'{esp_name}' is too small ({esp_size} < {esp_min} sectors)")
+    for i in used:
+        if i != root and entries[i][3] >= rstart:
+            fail(f"'{root_name}' is not the last partition on the board")
+
+    align = MIB // SECTOR
+    boot_start = (rstart + align - 1) // align * align
+    root_start = (boot_start + boot_sectors + align - 1) // align * align
+    if last - root_start + 1 < root_min:
+        fail("the eMMC is too small for this image")
+    free = [i for i in range(n) if entries[i][0] == bytes(16)]
+    if not free:
+        fail("no free partition slot in the board's GPT")
+
+    types = {"lvm": LVM_TYPE, "linux": LINUX_TYPE}
+    if root_type not in types:
+        fail(f"unknown QDL_ROOT_TYPE '{root_type}'")
+    entries[root][0] = types[root_type].bytes_le
+    entries[root][2], entries[root][3] = root_start, last
+    name = "boot".encode("utf-16-le").ljust(72, b"\0")
+    entries[free[0]] = [XBOOTLDR_TYPE.bytes_le, uuid.uuid4().bytes_le, boot_start,
+                        boot_start + boot_sectors - 1, 0, name]
+
+    new_raw = b"".join(ENT.pack(*e) for e in entries)
+    new_raw += bytes(ent_sectors * SECTOR - len(new_raw))
+    h[13] = crc(new_raw[: n * esz])
+    primary = d[:SECTOR] + header_bytes(h) + new_raw
+    b = list(h)
+    b[5], b[6], b[10] = alt_lba, 1, alt_lba - ent_sectors
+    backup = new_raw + header_bytes(b)
+    open(f"{outdir}/gpt-main.bin", "wb").write(primary)
+    open(f"{outdir}/gpt-backup.bin", "wb").write(backup)
+
+    print("ESP_START", entries[esp][2])
+    print("BOOT_START", boot_start)
+    print("ROOT_START", root_start)
+    print("ROOT_SECTORS", last - root_start + 1)
+    print("BACKUP_START", alt_lba - ent_sectors)
+    print("DISK_SECTORS", alt_lba + 1)
+
+
+if sys.argv[1] == "split":
+    split(sys.argv[2])
+elif sys.argv[1] == "plan":
+    plan(*sys.argv[2:10])
+else:
+    fail("unknown helper command")
+PY
+
+py_helper() { python3 -I -c "$PY_HELPER" "$@"; }
+
+# The firehose programmer is Qualcomm's loader that qdl uploads to the board.
+# It is taken from the board vendor's own image archive; only the start of
+# the archive is downloaded, and the file is checked against its SHA-256.
+fetch_programmer() {
+    local cache file part
+    cache="$(cache_dir)"
+    mkdir -p "$cache"
+    file="$cache/firehose-${CONF[QDL_PROGRAMMER_SHA256]:0:16}.elf"
+    if [ -f "$file" ] && sha256_ok "$file" "${CONF[QDL_PROGRAMMER_SHA256]}"; then
+        printf '%s\n' "$file"; return
+    fi
+    part="$file.part"
+    local host="${CONF[QDL_PROGRAMMER_URL]#*//}"
+    info "Fetching the Qualcomm firehose programmer from ${host%%/*}" >&2
+    case "${CONF[QDL_PROGRAMMER_FORMAT]:-tar.zst}" in
+        tar.zst)
+            need zstd; need tar
+            # tar stops once it has the file, which cuts the download short.
+            (curl -fsSL "${CONF[QDL_PROGRAMMER_URL]}" | zstd -dcq \
+                | tar -xO --occurrence=1 "${CONF[QDL_PROGRAMMER_PATH]}") > "$part" 2>/dev/null || true ;;
+        elf)
+            curl -fsSL -o "$part" "${CONF[QDL_PROGRAMMER_URL]}" || true ;;
+        *) die "unsupported QDL_PROGRAMMER_FORMAT '${CONF[QDL_PROGRAMMER_FORMAT]}'" ;;
+    esac
+    if ! [ -s "$part" ] || ! sha256_ok "$part" "${CONF[QDL_PROGRAMMER_SHA256]}"; then
+        rm -f "$part"
+        die "could not get a programmer with the expected checksum"
+    fi
+    mv "$part" "$file"
+    printf '%s\n' "$file"
+}
+
+edl_present() {
+    local d
+    for d in /sys/bus/usb/devices/*; do
+        [ -r "$d/idVendor" ] || continue
+        if [ "$(cat "$d/idVendor")" = 05c6 ] && [ "$(cat "$d/idProduct")" = 9008 ]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+wait_for_edl() {
+    [ "${VFLASHER_TEST:-}" = 1 ] && return 0
+    local i
+    for ((i = 0; i < 300; i++)); do
+        edl_present && return 0
+        [ "$i" -eq 0 ] && info "Waiting for a board in EDL mode (USB 05c6:9008)..."
+        sleep 1
+    done
+    die "no board in EDL mode found after 5 minutes"
+}
+
+# Insert "devicetree (\$root)/dtb/<DTB>" into the GRUB stubs on the EFI
+# partition, right after they locate /boot. /boot/dtb always points at the
+# newest kernel's device trees, so this keeps working after kernel updates.
+add_devicetree_to_esp() {
+    local esp="$1" dtb="$2" f tmp found=0
+    need mtype; need mcopy
+    tmp="$(dirname "$esp")/stub.cfg"
+    for f in ::/EFI/fedora/grub.cfg ::/EFI/BOOT/grub.cfg; do
+        MTOOLS_SKIP_CHECK=1 mtype -i "$esp" "$f" > "$tmp" 2>/dev/null || continue
+        found=1
+        grep -q '^devicetree ' "$tmp" && continue
+        awk -v line="devicetree (\$root)/dtb/$dtb" '{ print } /^set prefix=/ { print line }' "$tmp" > "$tmp.new"
+        grep -q '^devicetree ' "$tmp.new" || die "unexpected GRUB stub in $f; not changing it"
+        MTOOLS_SKIP_CHECK=1 mcopy -o -i "$esp" "$tmp.new" "$f"
+    done
+    rm -f "$tmp" "$tmp.new"
+    [ "$found" -eq 1 ] || die "no GRUB stub found on the image's EFI partition"
+}
+
+flash_qdl() {
+    local image="$1" assume_yes="$2"
+    local storage="${CONF[QDL_STORAGE]:-emmc}" esp_name="${CONF[QDL_ESP_PARTITION]:-efi}"
+    local root_name="${CONF[QDL_ROOT_PARTITION]:-system}"
+    need python3; need awk
+    [ "$QDL" != qdl ] || need qdl
+    [ "${VFLASHER_TEST:-}" = 1 ] || [ -d /sys/bus/usb/devices ] || die "cannot see USB devices (/sys/bus/usb)"
+
+    local prog; prog="$(fetch_programmer)"
+
+    local work
+    work="$(mktemp -d "$(cache_dir)/work.XXXXXX")"
+    # shellcheck disable=SC2064
+    trap "rm -rf '$work'" EXIT
+
+    info "Unpacking the image's partitions"
+    local unpack; unpack="$(decompress_cmd)"
+    local -a parts=()
+    local name sectors
+    # shellcheck disable=SC2086
+    while read -r name _ sectors; do
+        parts+=("$name:$sectors")
+    done < <($unpack "$image" | py_helper split "$work")
+    [ ${#parts[@]} -eq 3 ] || die "expected an image with 3 partitions (EFI, /boot, root), found ${#parts[@]}"
+    local esp_sectors="${parts[0]#*:}" boot_sectors="${parts[1]#*:}" root_sectors="${parts[2]#*:}"
+
+    if [ -n "${CONF[DTB]:-}" ]; then
+        info "Setting the device tree to ${CONF[DTB]}"
+        add_devicetree_to_esp "$work/p1.img" "${CONF[DTB]}"
+    fi
+
+    echo
+    echo "Put the board in EDL mode and connect it to this computer over USB-C."
+    local hint="${CONF[EDL_HINT]:-}"
+    echo "${hint:-See the documentation of the board for how to enter EDL mode.}"
+    if [ "$assume_yes" -eq 0 ]; then
+        # shellcheck disable=SC2034  # the answer is not needed
+        local dummy=""
+        ask "Press Enter when the board is connected in EDL mode..." dummy
+    fi
+    wait_for_edl
+
+    info "Reading the board's partition table"
+    "$QDL" --storage "$storage" "$prog" read 0/0+34 "$work/board-gpt.bin" \
+        || die "qdl could not read the board (is it in EDL mode?)"
+
+    local -A plan=()
+    local key val
+    while read -r key val; do plan[$key]="$val"; done < <(
+        py_helper plan "$work/board-gpt.bin" "$esp_name" "$root_name" \
+            "$boot_sectors" "$esp_sectors" "$root_sectors" "${CONF[QDL_ROOT_TYPE]:-linux}" "$work")
+    [ -n "${plan[ROOT_START]:-}" ] || die "could not plan the new partition layout"
+
+    echo
+    echo "VFlasher will write ${CONF[NAME]} to the board's $storage:"
+    printf '  %-8s at sector %-10s (%s)\n' "$esp_name" "${plan[ESP_START]}" "EFI system partition" \
+        boot "${plan[BOOT_START]}" "/boot, new partition" \
+        "$root_name" "${plan[ROOT_START]}" "root, $(( plan[ROOT_SECTORS] / 2048 / 1024 )) GiB"
+    echo "Firmware partitions are kept. The current OS on the board will be ERASED."
+    if [ "$assume_yes" -eq 0 ]; then
+        local answer=""
+        ask "Type 'yes' to continue: " answer
+        [ "$answer" = yes ] || die "aborted"
+    fi
+
+    # The programmer reset the board after the read; it comes back in EDL
+    # mode while the EDL jumper is still fitted.
+    wait_for_edl
+    info "Flashing (this takes a while; do not disconnect the board)"
+    "$QDL" --storage "$storage" "$prog" \
+        write "0/${plan[ESP_START]}" "$work/p1.img" \
+        write "0/${plan[BOOT_START]}" "$work/p2.img" \
+        write "0/${plan[ROOT_START]}" "$work/p3.img" \
+        write "0/${plan[BACKUP_START]}" "$work/gpt-backup.bin" \
+        write 0/0 "$work/gpt-main.bin" \
+        || die "qdl failed while flashing; re-run VFlasher, or restore the vendor image with its own flasher"
+
+    info "Done. ${CONF[NAME]} is on the board."
+    echo "Remove the EDL jumper and power-cycle the board."
+    if [ -n "${CONF[FIRST_BOOT]:-}" ]; then
+        echo "After the first login, run this to use the whole $storage:"
+        echo "  ${CONF[FIRST_BOOT]}"
+    fi
+}
+
 # -------------------------------------------------------------------- main
 
 main() {
@@ -276,10 +653,15 @@ main() {
 
     if [ "$info_only" -eq 1 ]; then show_info; exit 0; fi
 
-    [ "${CONF[FLASH_METHOD]}" = dd ] \
-        || die "flash method '${CONF[FLASH_METHOD]}' is not supported by this VFlasher version"
+    local method="${CONF[FLASH_METHOD]}"
+    case "$method" in
+        dd) ;;
+        qdl) [ -z "$device" ] || die "--device is not used for this board; it is flashed over USB in EDL mode" ;;
+        *) die "flash method '$method' is not supported by this VFlasher version" ;;
+    esac
 
-    if [ "$download_only" -eq 0 ] && [ "$(id -u)" -ne 0 ]; then
+    # VFLASHER_TEST=1 is used by tests/, which flash a disk-image file instead of a board.
+    if [ "$download_only" -eq 0 ] && [ "$(id -u)" -ne 0 ] && [ "${VFLASHER_TEST:-}" != 1 ]; then
         die "flashing needs root; run with sudo (or use --download-only)"
     fi
 
@@ -287,7 +669,7 @@ main() {
     info "${CONF[NAME]}"
 
     # Pick and check the target before a possibly long download.
-    if [ "$download_only" -eq 0 ]; then
+    if [ "$download_only" -eq 0 ] && [ "$method" = dd ]; then
         need lsblk; need dd
         [ -n "$device" ] || device="$(pick_device)"
         [ -n "$device" ] || die "no device given"
@@ -298,6 +680,11 @@ main() {
     if [ "$download_only" -eq 1 ]; then
         info "Image verified: $image"
         exit 0
+    fi
+
+    if [ "$method" = qdl ]; then
+        flash_qdl "$image" "$assume_yes"
+        return
     fi
 
     if [ "$assume_yes" -eq 0 ]; then

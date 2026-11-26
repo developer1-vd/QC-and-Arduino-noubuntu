@@ -20,8 +20,13 @@ jobs:
       - name: Check vflasher script
         run: |
           bash -n vflasher
-          shellcheck vflasher
+          shellcheck vflasher tests/fake-qdl tests/test-qdl-flash.sh
           ./vflasher --list
+      - name: EDL/qdl flashing test (fake board)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq gdisk mtools zstd
+          tests/test-qdl-flash.sh
       - name: Core tests
         run: dotnet test windows/tests/VFlasher.Core.Tests
 

@@ -10,9 +10,10 @@ Run `./vflasher --list` to see the available images and `./vflasher --help` for 
 
 Currently supported:
 
-| Manufacturer | Board | OS |
-|---|---|---|
-| qualcomm | [iq9075-evk](images/qualcomm/iq9075-evk/fedora/) | fedora |
+| Manufacturer | Board | OS | How it is flashed |
+|---|---|---|---|
+| qualcomm | [iq9075-evk](images/qualcomm/iq9075-evk/fedora/) | fedora | to a USB/NVMe/SD drive (Linux or Windows) |
+| arduino | [ventuno-q](images/arduino/ventuno-q/fedora/) | fedora | to the on-board eMMC over USB-C in EDL mode (Linux) |
 
 ---
 

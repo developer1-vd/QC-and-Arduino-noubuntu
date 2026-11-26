@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# Stand-in for qdl, used by the tests: runs qdl's raw "read" and "write"
+# commands against a disk-image file ($FAKE_QDL_DISK) instead of a board.
+set -euo pipefail
+disk="${FAKE_QDL_DISK:?FAKE_QDL_DISK must name a disk image}"
+while [[ ${1:-} == --* ]]; do
+    case "$1" in
+        --storage) shift 2 ;;
+        *) shift ;;
+    esac
+done
+prog="$1"; shift
+[ -s "$prog" ] || { echo "fake-qdl: programmer '$prog' missing" >&2; exit 1; }
+while [ $# -gt 0 ]; do
+    [ $# -ge 3 ] || { echo "fake-qdl: incomplete command: $*" >&2; exit 1; }
+    cmd="$1" addr="$2" file="$3"; shift 3
+    [[ $addr =~ ^0/([0-9]+)(\+([0-9]+))?$ ]] || { echo "fake-qdl: bad address $addr" >&2; exit 1; }
+    start="${BASH_REMATCH[1]}" count="${BASH_REMATCH[3]}"
+    case "$cmd" in
+        read)
+            [ -n "$count" ] || { echo "fake-qdl: read needs N/S+L" >&2; exit 1; }
+            dd if="$disk" of="$file" bs=512 skip="$start" count="$count" status=none ;;
+        write)
+            size=$(stat -c %s "$file")
+            [ $((size % 512)) -eq 0 ] || { echo "fake-qdl: $file is not whole sectors" >&2; exit 1; }
+            [ $((start * 512 + size)) -le "$(stat -c %s "$disk")" ] || { echo "fake-qdl: write past end of disk" >&2; exit 1; }
+            dd if="$file" of="$disk" bs=1M oflag=seek_bytes seek=$((start * 512)) conv=notrunc status=none ;;
+        *) echo "fake-qdl: unknown command $cmd" >&2; exit 1 ;;
+    esac
+    echo "$cmd $addr $(basename "$file")" >> "${FAKE_QDL_LOG:-/dev/null}"
+done
