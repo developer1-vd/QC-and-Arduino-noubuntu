@@ -6,7 +6,7 @@
 | OS | Fedora Server 45, aarch64 (kernel 7.2.11) |
 | Image | `Fedora-Server-Host-Generic-45-1.4.aarch64.raw.xz` (official Fedora build) |
 | Installs to | On-board 64 GB eMMC, over USB-C in Qualcomm EDL mode |
-| Flash method | `qdl` (Linux only for now) |
+| Flash method | `qdl`, from Linux or Windows |
 | Status | **Untested on hardware.** Tested against a simulated eMMC, see below |
 
 The VENTUNO Q can't boot from its NVMe slot. Its USB-A ports sit behind a PCIe
@@ -43,7 +43,14 @@ The Qualcomm firehose programmer that `qdl` needs comes from Arduino's official
 Ubuntu image archive. VFlasher downloads only the first ~9 MB of that archive
 and checks the programmer against the SHA-256 in [`image.conf`](image.conf).
 
-## Flashing
+## Flashing from Windows
+
+Install VFlasher with the [setup wizard](../../../../windows/), which brings
+`qdl` and the USB driver. Start it, pick **arduino/ventuno-q** and **Fedora**,
+click **Flash**, and follow the prompts. The steps are the same as on Linux
+below.
+
+## Flashing from Linux
 
 Needs a Linux PC with `qdl` (`sudo dnf install qdl` on Fedora, `sudo apt install
 qdl` on Debian/Ubuntu), plus `python3`, `mtools`, `zstd` and `xz`.
@@ -88,8 +95,6 @@ App Lab) as usual.
   UEFI menu. The firmware then finds Fedora's `\EFI\BOOT\BOOTAA64.EFI` on `efi`.
 - Fedora's `systemd-repart` grows the root partition only for its own disk
   layouts; use the command above instead.
-- The Windows app can't flash this board yet. It writes images to drives and
-  doesn't do EDL.
 
 ## Sources
 

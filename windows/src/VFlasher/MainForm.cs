@@ -1,9 +1,10 @@
 using System.Diagnostics;
 using VFlasher.Core;
+using VFlasher.Core.Qdl;
 
 namespace VFlasher;
 
-internal sealed class MainForm : Form
+internal sealed class MainForm : Form, IQdlUserInterface
 {
     readonly ComboBox boardBox = new() { DropDownStyle = ComboBoxStyle.DropDownList, Dock = DockStyle.Fill };
     readonly ComboBox osBox = new() { DropDownStyle = ComboBoxStyle.DropDownList, Dock = DockStyle.Fill };
@@ -93,7 +94,16 @@ internal sealed class MainForm : Form
     ImageManifest? SelectedManifest => osBox.SelectedItem as ImageManifest;
     DiskInfo? SelectedDisk => driveBox.SelectedItem as DiskInfo;
 
-    void Log(string line) => log.AppendText(line + Environment.NewLine);
+    public void Log(string line)
+    {
+        // qdl output arrives on background threads.
+        if (InvokeRequired)
+            BeginInvoke(() => Log(line));
+        else
+            log.AppendText(line + Environment.NewLine);
+    }
+
+    bool IsEdl => SelectedManifest?.FlashMethod == "qdl";
 
     async Task LoadManifestsAsync()
     {
@@ -157,8 +167,17 @@ internal sealed class MainForm : Form
         if (m == null) { imageInfo.Text = ""; UpdateButtons(); return; }
         var size = m.ImageSize is { } s ? $", {DiskInfo.FormatSize(s)} download" : "";
         imageInfo.Text = $"{m.Name}{size}\nSource: {m.ImageUrl.Host}";
-        if (m.FlashMethod != "dd")
-            imageInfo.Text += $"\nThis image uses the '{m.FlashMethod}' flash method, which the Windows app does not support yet. Use the Linux vflasher.";
+        if (m.FlashMethod == "qdl")
+        {
+            imageInfo.Text += "\nThis board is flashed over USB-C in EDL mode: no drive is needed. " +
+                              "Its firmware partitions are kept; the OS on the board is replaced.";
+            if (QdlTool.Path == null)
+                imageInfo.Text += "\nqdl.exe was not found next to VFlasher. Install VFlasher with the setup wizard.";
+        }
+        else if (m.FlashMethod != "dd")
+        {
+            imageInfo.Text += $"\nThis image uses the '{m.FlashMethod}' flash method, which this version does not support.";
+        }
         UpdateButtons();
     }
 
@@ -182,12 +201,114 @@ internal sealed class MainForm : Form
     void UpdateButtons()
     {
         var busy = cts != null;
-        flashButton.Enabled = !busy && SelectedManifest is { FlashMethod: "dd" } && SelectedDisk != null;
+        flashButton.Enabled = !busy && SelectedManifest switch
+        {
+            { FlashMethod: "dd" } => SelectedDisk != null,
+            { FlashMethod: "qdl" } => QdlTool.Path != null,
+            _ => false,
+        };
         cancelButton.Enabled = busy;
-        boardBox.Enabled = osBox.Enabled = driveBox.Enabled = refreshButton.Enabled = showAll.Enabled = !busy;
+        boardBox.Enabled = osBox.Enabled = !busy;
+        driveBox.Enabled = refreshButton.Enabled = showAll.Enabled = !busy && !IsEdl;
     }
 
     async Task FlashAsync()
+    {
+        if (IsEdl)
+            await FlashEdlAsync();
+        else
+            await FlashDriveAsync();
+    }
+
+    Progress<TransferProgress> NewProgress() => new(p =>
+    {
+        if (p.Total is > 0)
+        {
+            progressBar.Style = ProgressBarStyle.Blocks;
+            progressBar.Value = (int)Math.Clamp(p.Done * 1000 / p.Total.Value, 0, 1000);
+            status.Text = $"{p.Stage}: {DiskInfo.FormatSize(p.Done)} / {DiskInfo.FormatSize(p.Total.Value)}";
+        }
+        else
+        {
+            progressBar.Style = ProgressBarStyle.Marquee;
+            status.Text = p.Done > 0 ? $"{p.Stage}: {DiskInfo.FormatSize(p.Done)}" : p.Stage + "…";
+        }
+    });
+
+    async Task FlashEdlAsync()
+    {
+        var m = SelectedManifest!;
+        var confirm = MessageBox.Show(this,
+            $"{m.Name} will be written to the board's on-board storage over USB-C.\n\n" +
+            "The operating system currently on the board will be ERASED. Its firmware is kept, and the " +
+            "vendor's own flasher can always restore the original image.\n\nContinue?",
+            "Confirm flashing", MessageBoxButtons.YesNo, MessageBoxIcon.Warning, MessageBoxDefaultButton.Button2);
+        if (confirm != DialogResult.Yes)
+            return;
+
+        cts = new CancellationTokenSource();
+        UpdateButtons();
+        var sw = Stopwatch.StartNew();
+        try
+        {
+            Log(await EdlDriver.InstallAsync(cts.Token));
+            var qdl = new ProcessQdlRunner(QdlTool.Path!);
+            var job = new QdlFlashJob(m, http, ImageDownloader.DefaultCacheDir(), qdl, new WindowsEdlDevice(), this,
+                SparseFiles.MarkSparse);
+            await job.RunAsync(NewProgress(), cts.Token);
+
+            progressBar.Style = ProgressBarStyle.Blocks;
+            progressBar.Value = 1000;
+            status.Text = "Done.";
+            Log($"Finished in {sw.Elapsed:hh\\:mm\\:ss}.");
+            MessageBox.Show(this, $"{m.Name} is on the board.\n\nRemove the EDL jumper and power-cycle the board.",
+                "VFlasher", MessageBoxButtons.OK, MessageBoxIcon.Information);
+        }
+        catch (OperationCanceledException)
+        {
+            status.Text = "Cancelled.";
+            Log("Cancelled. If flashing had started, flash again or restore the vendor image.");
+        }
+        catch (Exception e)
+        {
+            status.Text = "Failed.";
+            Log("Error: " + e.Message);
+            MessageBox.Show(this, e.Message, "VFlasher", MessageBoxButtons.OK, MessageBoxIcon.Error);
+        }
+        finally
+        {
+            progressBar.Style = ProgressBarStyle.Blocks;
+            cts.Dispose();
+            cts = null;
+            UpdateButtons();
+        }
+    }
+
+    public Task<bool> AskForEdlModeAsync(string hint)
+    {
+        var r = MessageBox.Show(this,
+            "Put the board in EDL mode and connect it to this computer over USB-C.\n\n" + hint +
+            "\n\nClick OK when it is connected. VFlasher then waits for it.",
+            "Connect the board", MessageBoxButtons.OKCancel, MessageBoxIcon.Information);
+        return Task.FromResult(r == DialogResult.OK);
+    }
+
+    public Task<bool> ConfirmPlanAsync(ImageManifest m, GptPlan plan, string espName, string rootName)
+    {
+        static string Gib(long sectors) => $"{sectors * 512.0 / (1L << 30):0.#} GiB";
+        var text =
+            $"The board's storage was read. VFlasher will write:\n\n" +
+            $"  {espName}: EFI system partition, at sector {plan.EspStart}\n" +
+            $"  boot: /boot (new partition), at sector {plan.BootStart}\n" +
+            $"  {rootName}: root, {Gib(plan.RootSectors)}, at sector {plan.RootStart}\n\n" +
+            "Firmware partitions are kept. The current OS on the board will be ERASED.\n\nFlash now?";
+        Log(text.Replace("\n\n", "\n"));
+        var r = MessageBox.Show(this, text, "Confirm flashing", MessageBoxButtons.YesNo, MessageBoxIcon.Warning,
+            MessageBoxDefaultButton.Button2);
+        return Task.FromResult(r == DialogResult.Yes);
+    }
+
+    async Task FlashDriveAsync()
     {
         var m = SelectedManifest!;
         var disk = SelectedDisk!;
@@ -199,12 +320,7 @@ internal sealed class MainForm : Form
 
         cts = new CancellationTokenSource();
         UpdateButtons();
-        var progress = new Progress<TransferProgress>(p =>
-        {
-            progressBar.Value = p.Total is > 0 ? (int)Math.Clamp(p.Done * 1000 / p.Total.Value, 0, 1000) : 0;
-            var total = p.Total is { } t ? " / " + DiskInfo.FormatSize(t) : "";
-            status.Text = $"{p.Stage}: {DiskInfo.FormatSize(p.Done)}{total}";
-        });
+        var progress = NewProgress();
         var sw = Stopwatch.StartNew();
         try
         {

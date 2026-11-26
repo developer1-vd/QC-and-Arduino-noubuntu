@@ -46,6 +46,9 @@ jobs:
         run: dotnet test windows/tests/VFlasher.Core.Tests
       - name: Publish vflasher.exe
         run: dotnet publish windows/src/VFlasher -c Release -r win-${{ matrix.arch }} -o windows/publish/win-${{ matrix.arch }}
+      - name: Fetch qdl and the EDL USB driver
+        shell: pwsh
+        run: windows/installer/fetch-edl-tools.ps1 -Dest windows/publish/win-${{ matrix.arch }}
       - name: Build installer
         shell: pwsh
         run: |
@@ -58,4 +61,6 @@ jobs:
           name: vflasher-windows-${{ matrix.arch }}
           path: |
             windows/publish/win-${{ matrix.arch }}/vflasher.exe
+            windows/publish/win-${{ matrix.arch }}/qdl/
+            windows/publish/win-${{ matrix.arch }}/drivers/
             windows/publish/vflasher-setup-*.exe

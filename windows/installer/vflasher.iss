@@ -2,6 +2,7 @@
 ;
 ; Build after publishing the app, from the repository root:
 ;   dotnet publish windows/src/VFlasher -c Release -r win-x64 -o windows/publish/win-x64
+;   pwsh windows/installer/fetch-edl-tools.ps1 -Dest windows/publish/win-x64
 ;   iscc /DArch=x64 windows\installer\vflasher.iss
 ; Use win-arm64 and /DArch=arm64 for Windows on Arm.
 
@@ -42,6 +43,9 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 
 [Files]
 Source: "{#PublishDir}\vflasher.exe"; DestDir: "{app}"; Flags: ignoreversion
+; qdl and the WinUSB driver for boards flashed over USB in EDL mode (see fetch-edl-tools.ps1)
+Source: "{#PublishDir}\qdl\*"; DestDir: "{app}\qdl"; Flags: ignoreversion
+Source: "{#PublishDir}\drivers\*"; DestDir: "{app}\drivers"; Flags: ignoreversion
 Source: "..\..\images\*"; DestDir: "{app}\images"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "..\..\README.md"; DestDir: "{app}"; Flags: ignoreversion isreadme
 
@@ -50,6 +54,8 @@ Name: "{group}\VFlasher"; Filename: "{app}\vflasher.exe"
 Name: "{autodesktop}\VFlasher"; Filename: "{app}\vflasher.exe"; Tasks: desktopicon
 
 [Run]
+Filename: "{sys}\pnputil.exe"; Parameters: "/add-driver ""{app}\drivers\qcserlib.inf"" /install"; \
+  StatusMsg: "Installing the USB driver for EDL flashing..."; Flags: runhidden
 Filename: "{app}\vflasher.exe"; Description: "{cm:LaunchProgram,VFlasher}"; Flags: nowait postinstall skipifsilent shellexec
 
 [Registry]
