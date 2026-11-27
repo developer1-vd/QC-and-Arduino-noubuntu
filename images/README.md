@@ -38,6 +38,8 @@ uses to list images online. A test checks that the two stay in sync.
 | `FLASH_METHOD` | yes | `dd` (write the image to a USB/NVMe/SD drive) or `qdl` (write it to on-board storage over USB in Qualcomm EDL mode) |
 | `IMAGE_SIZE` | no | Download size in bytes |
 | `DTB` | no | Device tree for the board. With `qdl`, GRUB is set up to load it |
+| `KERNEL_ARGS` | no | Kernel options the board needs, added to the boot entries and `/etc/kernel/cmdline` |
+| `SERIAL_CONSOLE` | no | The board's serial console (e.g. `ttyMSM0,115200n8`), used by `--boot-log` |
 | `OS_VERSION`, `ARCH` | no | Informational |
 
 Extra keys for `FLASH_METHOD=qdl`:

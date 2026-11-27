@@ -752,27 +752,57 @@ check_unpack_space() { # IMAGE WORK
     fi
 }
 
-# --boot-log: show the boot on the serial console. Removes rhgb/quiet from the
-# boot entries and adds earlycon plus the board's serial console (the last
-# console= is where systemd starts the login prompt). Fedora's kernel-install
-# copies the running command line, so later kernels keep it.
-enable_boot_log() { # WORK BOOT_IMAGE CONSOLE
-    local work="$1" mnt="$1/mnt-bootlog" e
+# Change the kernel command line in the image: in /boot's boot entries (the
+# kernel that boots now) and in the root file system's /etc/kernel/cmdline if
+# there is one (what Fedora's kernel-install uses for later kernels). Words in
+# DROP are removed ("console=" removes every console=...), then the words in
+# ADD that are missing are appended.
+edit_kernel_cmdline() { # WORK BOOT_IMAGE ROOT_IMAGE DROP ADD
+    local work="$1" mnt="$1/mnt-cmdline" e fs off fsize _u _l _s l f opts=()
+    # shellcheck disable=SC2016  # an awk program, not shell
+    local filter='
+        function keep(w,   i, n, d) {
+            n = split(drop, d, " ")
+            for (i = 1; i <= n; i++)
+                if (w == d[i] || (d[i] ~ /=$/ && index(w, d[i]) == 1)) return 0
+            return 1
+        }
+        function fix(first, from,   i, out, n, a, seen) {
+            out = first
+            for (i = from; i <= NF; i++)
+                if (keep($i)) { out = out (out == "" ? "" : " ") $i; seen[$i] = 1 }
+            n = split(add, a, " ")
+            for (i = 1; i <= n; i++)
+                if (!(a[i] in seen)) out = out (out == "" ? "" : " ") a[i]
+            return out
+        }
+        mode == "bls" && $1 == "options" { $0 = fix("options", 2) }
+        mode == "cmdline" && NF { $0 = fix("", 1) }
+        { print }'
     need mount; need umount
     mkdir -p "$mnt"
     mount -o loop "$2" "$mnt" || die "could not mount the image's /boot"
     for e in "$mnt"/loader/entries/*.conf; do
         [ -f "$e" ] || continue
-        awk -v add="earlycon console=tty0 console=$3" '
-            $1 == "options" {
-                out = "options"
-                for (i = 2; i <= NF; i++)
-                    if ($i != "rhgb" && $i != "quiet" && $i != "earlycon" && $i !~ /^console=/) out = out " " $i
-                $0 = out " " add
-            }
-            { print }' "$e" > "$work/entry.new" && cat "$work/entry.new" > "$e"
+        awk -v drop="$4" -v add="$5" -v mode=bls "$filter" "$e" > "$work/cmdline.new" && cat "$work/cmdline.new" > "$e"
     done
     umount "$mnt"
+
+    read -r fs off fsize _u _l _s < <(py_helper find-fs "$3")
+    case "$fs" in
+        btrfs) opts=(-o subvolid=5) ;;
+        xfs) opts=(-o nouuid) ;;
+        ext4) ;;
+        *) return 0 ;;
+    esac
+    l="$(losetup -f --show -o "$off" --sizelimit "$fsize" "$3")"
+    mount "${opts[@]}" "$l" "$mnt" || { losetup -d "$l"; die "could not mount the image's root file system"; }
+    f="$(find "$mnt" -maxdepth 4 -path '*/etc/kernel/cmdline' -type f | head -n1)"
+    if [ -n "$f" ]; then
+        awk -v drop="$4" -v add="$5" -v mode=cmdline "$filter" "$f" > "$work/cmdline.new" && cat "$work/cmdline.new" > "$f"
+    fi
+    rm -f "$work/cmdline.new"
+    umount "$mnt"; losetup -d "$l"
 }
 
 # --root-password: set root's password (a SHA-512 crypt hash) in the image's
@@ -992,9 +1022,16 @@ flash_qdl() {
         info "Setting the device tree to ${CONF[DTB]}"
         add_devicetree_to_esp "$work/p1.img" "${CONF[DTB]}"
     fi
+    if [ -n "${CONF[KERNEL_ARGS]:-}" ]; then
+        info "Adding kernel options for this board: ${CONF[KERNEL_ARGS]}"
+        edit_kernel_cmdline "$work" "$work/p2.img" "$work/p3.img" "" "${CONF[KERNEL_ARGS]}"
+    fi
     if [ "$boot_log" -eq 1 ]; then
+        # --boot-log: the whole boot and a login prompt on the serial console
+        # (the last console= is where systemd starts the login prompt).
         info "Showing the boot on the serial console (${CONF[SERIAL_CONSOLE]})"
-        enable_boot_log "$work" "$work/p2.img" "${CONF[SERIAL_CONSOLE]}"
+        edit_kernel_cmdline "$work" "$work/p2.img" "$work/p3.img" "rhgb quiet earlycon console=" \
+            "earlycon console=tty0 console=${CONF[SERIAL_CONSOLE]}"
     fi
     if [ -n "$pw_hash" ]; then
         info "Setting the root password"

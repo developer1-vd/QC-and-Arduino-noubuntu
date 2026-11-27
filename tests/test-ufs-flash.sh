@@ -81,6 +81,8 @@ mkdir -p "$mnt/root/etc"
 printf 'UUID=%s / btrfs compress=zstd:1,defaults,subvol=root 0 1\n' "$ROOT_UUID" > "$mnt/root/etc/fstab"
 echo kept > "$mnt/root/etc/marker"
 printf 'root:!locked::0:99999:7:::\nbin:*:20000:0:99999:7:::\n' > "$mnt/root/etc/shadow"
+mkdir -p "$mnt/root/etc/kernel"
+echo "root=UUID=$ROOT_UUID rootflags=subvol=root rhgb quiet" > "$mnt/root/etc/kernel/cmdline"
 umount "$mnt"
 
 python3 -I - "$t/src" root fedora.raw <<'PY'
@@ -153,6 +155,7 @@ QDL_PROGRAMMER_PATH=fw/prog_firehose_ddr.elf
 QDL_PROGRAMMER_SHA256=$(sha256sum "$t/bundle/fw/prog_firehose_ddr.elf" | cut -d' ' -f1)
 DTB=qcom/test-board.dtb
 SERIAL_CONSOLE=ttyMSM0,115200n8
+KERNEL_ARGS=clk_ignore_unused pd_ignore_unused
 EOF
 
 run_vflasher() {
@@ -192,7 +195,8 @@ ok "EFI partition: 4096-byte sectors, serial kept, files copied, device tree set
 
 B="$(loop -r -b 4096 -o $(( $(start 2) * 4096 )) "$t/lun0.img")"
 mount -o ro "$B" "$mnt"
-grep -q "options root=UUID=$ROOT_UUID ro rhgb quiet\$" "$mnt/loader/entries/a.conf" || bad "BLS entry: $(cat "$mnt/loader/entries/a.conf")"
+grep -q "options root=UUID=$ROOT_UUID ro rhgb quiet clk_ignore_unused pd_ignore_unused\$" "$mnt/loader/entries/a.conf" \
+    || bad "BLS entry: $(cat "$mnt/loader/entries/a.conf")"
 grep -q "kernelopts=\"root=UUID=$ROOT_UUID ro  \"" "$mnt/grub2/grub.cfg" || bad "grub.cfg fallback not updated"
 grep -q '^set root=hd0$' "$mnt/grub2/grub.cfg" || bad "grub.cfg 'set root' was changed"
 umount "$mnt"
@@ -203,7 +207,8 @@ mount -o ro,nouuid "$R" "$mnt" || bad "root XFS does not mount from a 4K-sector 
 [ "$(blkid -p -o value -s UUID "$R")" = "$ROOT_UUID" ] || bad "root UUID changed"
 grep -q "^UUID=$ROOT_UUID / xfs defaults,x-systemd.growfs 0 1\$" "$mnt/etc/fstab" || bad "fstab: $(cat "$mnt/etc/fstab")"
 grep -q "^UUID=$BOOT_UUID /boot ext4 defaults 0 0\$" "$mnt/etc/fstab" || bad "fstab /boot line changed"
-[ "$(cat "$mnt/etc/kernel/cmdline")" = "root=UUID=$ROOT_UUID ro" ] || bad "cmdline: $(cat "$mnt/etc/kernel/cmdline")"
+[ "$(cat "$mnt/etc/kernel/cmdline")" = "root=UUID=$ROOT_UUID ro clk_ignore_unused pd_ignore_unused" ] \
+    || bad "cmdline: $(cat "$mnt/etc/kernel/cmdline")"
 [ ! -e "$mnt/etc/lvm/devices/system.devices" ] && [ ! -e "$mnt/etc/lvm/devices/auto-import-rootvg" ] || bad "LVM device files left"
 [ "$(sha256sum < "$mnt/usr/bin/tool")" = "$sha_tool" ] || bad "file contents changed"
 [ "$(stat -c %a "$mnt/usr/bin/tool")" = 755 ] || bad "mode not kept"
@@ -241,6 +246,8 @@ hash="$(awk -F: '$1 == "root" { print $2 }' "$mnt/root/etc/shadow")"
 salt="$(cut -d'$' -f3 <<<"$hash")"
 [ "$(openssl passwd -6 -salt "$salt" s3cret)" = "$hash" ] || bad "root password not set: $hash"
 grep -q '^bin:\*:20000:' "$mnt/root/etc/shadow" || bad "other shadow lines changed"
+want="root=UUID=$ROOT_UUID rootflags=subvol=root clk_ignore_unused pd_ignore_unused earlycon console=tty0 console=ttyMSM0,115200n8"
+[ "$(cat "$mnt/root/etc/kernel/cmdline")" = "$want" ] || bad "btrfs /etc/kernel/cmdline: $(cat "$mnt/root/etc/kernel/cmdline")"
 umount "$mnt"
 ok "btrfs root (Fedora Workstation) is kept, mounts from a 4K device, and grows on first boot"
 ok "--root-password sets root's password (SHA-512) and leaves other accounts alone"
@@ -248,9 +255,10 @@ B="$(loop -r -b 4096 -o $(( $(start 2) * 4096 )) "$t/lun0.img")"
 mount -o ro "$B" "$mnt"
 opts="$(grep '^options' "$mnt/loader/entries/a.conf")"
 umount "$mnt"
-[[ $opts == *" earlycon console=tty0 console=ttyMSM0,115200n8" && $opts != *rhgb* && $opts != *quiet* ]] \
+[[ $opts == *" clk_ignore_unused pd_ignore_unused earlycon console=tty0 console=ttyMSM0,115200n8" && $opts != *rhgb* && $opts != *quiet* ]] \
     || bad "--boot-log options: $opts"
-ok "--boot-log drops rhgb/quiet and sends the boot to the serial console"
+ok "--boot-log drops rhgb/quiet and sends the boot to the serial console (boot entries and /etc/kernel/cmdline)"
+ok "KERNEL_ARGS from the manifest reach the boot entries and /etc/kernel/cmdline"
 
 # Too little space for unpacking: a clear error, nothing written, nothing left.
 mkdir -p "$t/small"
