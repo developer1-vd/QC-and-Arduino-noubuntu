@@ -81,7 +81,15 @@ mkdir -p "$mnt/root/etc"
 printf 'UUID=%s / btrfs compress=zstd:1,defaults,subvol=root 0 1\n' "$ROOT_UUID" > "$mnt/root/etc/fstab"
 echo kept > "$mnt/root/etc/marker"
 printf 'root:!locked::0:99999:7:::\nbin:*:20000:0:99999:7:::\n' > "$mnt/root/etc/shadow"
-mkdir -p "$mnt/root/etc/kernel"
+mkdir -p "$mnt/root/etc/kernel" "$mnt/root/etc/ssh" "$mnt/root/etc/selinux" "$mnt/root/usr/lib/systemd/system" \
+    "$mnt/root/etc/systemd/system/multi-user.target.wants"
+echo 'ID=fedora' > "$mnt/root/etc/os-release"
+echo '# sshd' > "$mnt/root/etc/ssh/sshd_config"
+setfattr -n security.selinux -v 'system_u:object_r:etc_t:s0' "$mnt/root/etc/ssh/sshd_config"
+echo '[Service]' > "$mnt/root/usr/lib/systemd/system/sshd.service"
+ln -s /usr/lib/systemd/system/other.service "$mnt/root/etc/systemd/system/multi-user.target.wants/other.service"
+setfattr -h -n security.selinux -v 'system_u:object_r:systemd_unit_file_t:s0' \
+    "$mnt/root/etc/systemd/system/multi-user.target.wants/other.service"
 echo "root=UUID=$ROOT_UUID rootflags=subvol=root rhgb quiet" > "$mnt/root/etc/kernel/cmdline"
 umount "$mnt"
 
@@ -233,7 +241,7 @@ sed -e "s#fedora.raw.xz#workstation.raw.xz#g" \
 make_lun normal
 VFLASHER_TEST=1 VFLASHER_IMAGES="$t/images" VFLASHER_CACHE="$t/cache" \
     VFLASHER_QDL="$here/fake-qdl" FAKE_QDL_DISK="$t/lun0.img" FAKE_QDL_LOG="$t/qdl.log" \
-    VFLASHER_ROOT_PASSWORD=s3cret "$repo/vflasher" test ufs workstation --yes --boot-log --root-password \
+    VFLASHER_ROOT_PASSWORD=s3cret "$repo/vflasher" test ufs workstation --yes --boot-log --root-password --ssh \
     > "$t/out-ws.txt" 2>&1 || { cat "$t/out-ws.txt"; bad "btrfs flash failed"; }
 grep -q 'btrfs root file system already works with 4096-byte sectors' "$t/out-ws.txt" || bad "btrfs root was not kept"
 L="$(loop -r -b 4096 "$t/lun0.img")"
@@ -246,11 +254,19 @@ hash="$(awk -F: '$1 == "root" { print $2 }' "$mnt/root/etc/shadow")"
 salt="$(cut -d'$' -f3 <<<"$hash")"
 [ "$(openssl passwd -6 -salt "$salt" s3cret)" = "$hash" ] || bad "root password not set: $hash"
 grep -q '^bin:\*:20000:' "$mnt/root/etc/shadow" || bad "other shadow lines changed"
+w="$mnt/root/etc/systemd/system/multi-user.target.wants/sshd.service"
+c="$mnt/root/etc/ssh/sshd_config.d/01-vflasher.conf"
+[ "$(readlink "$w")" = /usr/lib/systemd/system/sshd.service ] || bad "sshd not enabled"
+grep -qx 'PermitRootLogin yes' "$c" && [ "$(stat -c %a "$c")" = 600 ] || bad "sshd drop-in wrong"
+[ "$(getfattr --only-values -n security.selinux "$c")" = 'system_u:object_r:etc_t:s0' ] || bad "drop-in SELinux label"
+[ "$(getfattr -h --only-values -n security.selinux "$w")" = 'system_u:object_r:systemd_unit_file_t:s0' ] || bad "unit link SELinux label"
+[ ! -e "$mnt/root/.autorelabel" ] || bad "relabel requested although labels were set"
 want="root=UUID=$ROOT_UUID rootflags=subvol=root clk_ignore_unused pd_ignore_unused earlycon console=tty0 console=ttyMSM0,115200n8"
 [ "$(cat "$mnt/root/etc/kernel/cmdline")" = "$want" ] || bad "btrfs /etc/kernel/cmdline: $(cat "$mnt/root/etc/kernel/cmdline")"
 umount "$mnt"
 ok "btrfs root (Fedora Workstation) is kept, mounts from a 4K device, and grows on first boot"
 ok "--root-password sets root's password (SHA-512) and leaves other accounts alone"
+ok "--ssh enables sshd with root password login, with correct SELinux labels"
 B="$(loop -r -b 4096 -o $(( $(start 2) * 4096 )) "$t/lun0.img")"
 mount -o ro "$B" "$mnt"
 opts="$(grep '^options' "$mnt/loader/entries/a.conf")"

@@ -36,6 +36,8 @@ Options:
                       serial console (EDL boards).
       --root-password Ask for a root password and set it in the image, to log
                       in on the serial console (EDL boards).
+      --ssh           Start the SSH server and let root log in with that
+                      password, to reach the board over Ethernet (EDL boards).
       --cache DIR     Keep downloads and work files in DIR (needs ~15 GB free
                       for the biggest images). Default: ~/.cache/vflasher.
       --download-only Download and verify the image, but do not flash.
@@ -827,6 +829,53 @@ set_root_password() { # WORK ROOT_IMAGE HASH
     umount "$mnt"; losetup -d "$l"
 }
 
+# --ssh: start the SSH server on boot and let root log in with its password,
+# to reach a board over Ethernet when its display and serial console don't
+# work. New files get the SELinux label of a matching existing file; if that
+# is not possible, the image relabels itself on first boot.
+enable_ssh() { # WORK ROOT_IMAGE
+    local work="$1" mnt="$1/mnt-ssh" fs off fsize _u _l _s l r unit wants conf label opts=()
+    read -r fs off fsize _u _l _s < <(py_helper find-fs "$2")
+    case "$fs" in
+        btrfs) opts=(-o subvolid=5) ;;
+        xfs) opts=(-o nouuid) ;;
+        ext4) ;;
+        *) die "--ssh: unsupported root file system '${fs:-unknown}'" ;;
+    esac
+    mkdir -p "$mnt"
+    l="$(losetup -f --show -o "$off" --sizelimit "$fsize" "$2")"
+    mount "${opts[@]}" "$l" "$mnt" || { losetup -d "$l"; die "could not mount the image's root file system"; }
+    r="$(dirname "$(dirname "$(find "$mnt" -maxdepth 3 -path '*/etc/os-release' | head -n1)")")"
+    unit="$(find "$r/usr/lib/systemd/system" -maxdepth 1 \( -name sshd.service -o -name ssh.service \) 2> /dev/null | head -n1)"
+    if [ -z "$unit" ] || [ ! -d "$r/etc/ssh" ]; then
+        umount "$mnt"; losetup -d "$l"
+        die "--ssh: this image has no SSH server"
+    fi
+    wants="$r/etc/systemd/system/multi-user.target.wants"
+    conf="$r/etc/ssh/sshd_config.d/01-vflasher.conf"
+    mkdir -p "$wants" "$(dirname "$conf")"
+    ln -sfn "/usr/lib/systemd/system/$(basename "$unit")" "$wants/$(basename "$unit")"
+    printf '# Added by VFlasher --ssh: root may log in with its password.\nPermitRootLogin yes\nPasswordAuthentication yes\n' > "$conf"
+    chmod 600 "$conf"
+
+    if [ -d "$r/etc/selinux" ]; then
+        if command -v getfattr > /dev/null && command -v setfattr > /dev/null \
+            && label="$(getfattr --only-values -n security.selinux "$r/etc/ssh/sshd_config" 2> /dev/null)" && [ -n "$label" ]; then
+            setfattr -n security.selinux -v "$label" "$conf"
+            local any
+            any="$(find "$wants" -maxdepth 1 -type l ! -name "$(basename "$unit")" | head -n1)"
+            if [ -n "$any" ] && label="$(getfattr -h --only-values -n security.selinux "$any" 2> /dev/null)"; then
+                setfattr -h -n security.selinux -v "$label" "$wants/$(basename "$unit")"
+            else
+                touch "$r/.autorelabel"
+            fi
+        else
+            touch "$r/.autorelabel"
+        fi
+    fi
+    umount "$mnt"; losetup -d "$l"
+}
+
 ask_root_password() { # -> prints the hash
     local p1="${VFLASHER_ROOT_PASSWORD:-}" p2
     need openssl
@@ -956,7 +1005,7 @@ rebuild_for_sector_size() { # WORK SS
 }
 
 flash_qdl() {
-    local image="$1" assume_yes="$2" boot_log="${3:-0}" root_pw="${4:-0}"
+    local image="$1" assume_yes="$2" boot_log="${3:-0}" root_pw="${4:-0}" ssh="${5:-0}"
     local storage="${CONF[QDL_STORAGE]:-emmc}" esp_name="${CONF[QDL_ESP_PARTITION]:-efi}"
     local root_name="${CONF[QDL_ROOT_PARTITION]:-system}"
     local layout="${CONF[QDL_LAYOUT]:-keep-firmware}" ss="${CONF[QDL_SECTOR_SIZE]:-512}" lun="${CONF[QDL_LUN]:-0}"
@@ -974,6 +1023,7 @@ flash_qdl() {
     [ "${VFLASHER_TEST:-}" = 1 ] || [ -d /sys/bus/usb/devices ] || die "cannot see USB devices (/sys/bus/usb)"
 
     local pw_hash=""
+    [ "$ssh" -eq 0 ] || [ "$root_pw" -eq 1 ] || die "--ssh needs --root-password (root logs in with it)"
     if [ "$root_pw" -eq 1 ]; then
         pw_hash="$(ask_root_password)" || exit 1
     fi
@@ -1036,6 +1086,10 @@ flash_qdl() {
     if [ -n "$pw_hash" ]; then
         info "Setting the root password"
         set_root_password "$work" "$work/p3.img" "$pw_hash"
+    fi
+    if [ "$ssh" -eq 1 ]; then
+        info "Enabling the SSH server (root login with password)"
+        enable_ssh "$work" "$work/p3.img"
     fi
 
     echo
@@ -1127,7 +1181,7 @@ flash_qdl() {
 # -------------------------------------------------------------------- main
 
 main() {
-    local device="" assume_yes=0 download_only=0 info_only=0 boot_log=0 root_pw=0
+    local device="" assume_yes=0 download_only=0 info_only=0 boot_log=0 root_pw=0 ssh=0
     local -a pos=()
 
     while [ $# -gt 0 ]; do
@@ -1141,6 +1195,7 @@ main() {
             --download-only) download_only=1 ;;
             --boot-log)      boot_log=1 ;;
             --root-password) root_pw=1 ;;
+            --ssh)           ssh=1 ;;
             --cache)         [ $# -ge 2 ] || die "$1 needs an argument"; VFLASHER_CACHE="$(realpath -m "$2")"; shift ;;
             --cache=*)       VFLASHER_CACHE="$(realpath -m "${1#*=}")" ;;
             --info)          info_only=1 ;;
@@ -1190,7 +1245,7 @@ main() {
     fi
 
     if [ "$method" = qdl ]; then
-        flash_qdl "$image" "$assume_yes" "$boot_log" "$root_pw"
+        flash_qdl "$image" "$assume_yes" "$boot_log" "$root_pw" "$ssh"
         return
     fi
 

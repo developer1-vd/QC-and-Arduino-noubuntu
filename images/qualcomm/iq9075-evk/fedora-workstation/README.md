@@ -108,6 +108,19 @@ chip's boot ROM, so the board can always be reflashed.
   of the debug port's channels, the one that prints UEFI and then Linux, not
   the `sail_proc@home$` one), ending in a `login:` prompt. Log in as `root` and
   run `dmesg | grep -i -E 'msm|drm|dp|gpu|firmware'`.
+- If the serial console turns to garbage partway through the boot (seen on a
+  real EVK at about 3.8 s), add `--ssh`, connect the EVK's Ethernet port to
+  your network, and log in from your PC instead:
+
+  ```bash
+  sudo ./vflasher qualcomm iq9075-evk fedora-workstation --root-password --ssh
+  ```
+
+  ```bash
+  ssh root@fedora.local
+  ```
+
+  (or use the address your router gave the board).
 - Only the two mini DP ports are enabled for display in the upstream device
   tree, so use one of those.
 - Windows can't flash this board: rebuilding the EFI partition for 4K sectors
