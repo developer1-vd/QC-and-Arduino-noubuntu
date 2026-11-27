@@ -196,6 +196,23 @@ sgdisk -v "$t/emmc.img" | grep -q 'No problems found' || bad "GPT invalid after 
 [ "$(region 0 16384 | tail -c +$((34 * 512 + 1)) | sha256sum)" = "$fw_before" ] || bad "firmware changed on re-flash"
 ok "re-flashing a VFlasher-flashed board gives the same layout"
 
+# The board drops off USB during the first two flash sessions (as a real
+# IQ-9075 EVK did): vflasher retries and the result is the same.
+new_board
+rm -f "$t/emmc.img.failures" "$t/qdl.log"
+FAKE_QDL_FAIL_WRITES=2 run_vflasher > "$t/out-retry.txt" 2>&1 || { cat "$t/out-retry.txt"; bad "retry run failed"; }
+grep -q 'qdl lost the board (attempt 2 of 3)' "$t/out-retry.txt" || bad "no retry message"
+sgdisk -v "$t/emmc.img" | grep -q 'No problems found' || bad "GPT invalid after retried flash"
+[ "$(region 0 16384 | tail -c +$((34 * 512 + 1)) | sha256sum)" = "$fw_before" ] || bad "firmware changed on retried flash"
+ok "retries when the board drops off USB during flashing (2 failed sessions, then success)"
+
+new_board
+cp "$t/emmc.img" "$t/emmc-before.img"
+rm -f "$t/emmc.img.failures"
+if FAKE_QDL_FAIL_WRITES=3 run_vflasher > "$t/out-retry3.txt" 2>&1; then bad "3 failed sessions should fail"; fi
+cmp -s "$t/emmc.img" "$t/emmc-before.img" || bad "disk changed although no session wrote"
+ok "gives up after 3 failed sessions, with the board unchanged"
+
 for layout in no-system small-efi; do
     new_board "$layout"
     cp "$t/emmc.img" "$t/emmc-before.img"

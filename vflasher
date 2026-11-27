@@ -664,6 +664,21 @@ wait_for_edl() {
     die "no board in EDL mode found after 5 minutes"
 }
 
+# After qdl finishes, the programmer resets the board, which comes back in EDL
+# mode while the EDL switch or jumper is still set. Wait for it to drop off
+# USB and come back, then give it a moment, so the next qdl session does not
+# start on a board that is still resetting.
+wait_for_edl_reconnect() {
+    [ "${VFLASHER_TEST:-}" = 1 ] && return 0
+    local i
+    for ((i = 0; i < 30; i++)); do
+        edl_present || break
+        sleep 0.5
+    done
+    wait_for_edl
+    sleep "${VFLASHER_EDL_SETTLE:-3}"
+}
+
 # Insert "devicetree (\$root)/dtb/<DTB>" into the GRUB stubs on the EFI
 # partition, right after they locate /boot. /boot/dtb always points at the
 # newest kernel's device trees, so this keeps working after kernel updates.
@@ -828,6 +843,21 @@ flash_qdl() {
     fi
 
     echo
+    if [ "$layout" = whole-lun ]; then
+        echo "VFlasher will replace LUN $lun of the board's $storage with ${CONF[NAME]}."
+        echo "The firmware on the other LUNs is kept."
+    else
+        echo "VFlasher will replace the OS partitions on the board's $storage with ${CONF[NAME]}."
+        echo "The firmware partitions are kept."
+    fi
+    echo "The current OS on the board will be ERASED."
+    if [ "$assume_yes" -eq 0 ]; then
+        local answer=""
+        ask "Type 'yes' to continue: " answer
+        [ "$answer" = yes ] || die "aborted"
+    fi
+
+    echo
     echo "Put the board in EDL mode and connect it to this computer over USB-C."
     local hint="${CONF[EDL_HINT]:-}"
     echo "${hint:-See the documentation of the board for how to enter EDL mode.}"
@@ -860,25 +890,12 @@ flash_qdl() {
     [ -n "${plan[ROOT_START]:-}" ] || die "could not plan the new partition layout"
 
     echo
-    echo "VFlasher will write ${CONF[NAME]} to the board's $storage:"
+    echo "Writing ${CONF[NAME]} to the board's $storage:"
     printf '  %-8s at sector %-10s (%s)\n' "$esp_name" "${plan[ESP_START]}" "EFI system partition" \
         boot "${plan[BOOT_START]}" "/boot" \
         "$root_name" "${plan[ROOT_START]}" "root, $(( plan[ROOT_SECTORS] * ss / 1024 / 1024 / 1024 )) GiB"
-    if [ "$layout" = whole-lun ]; then
-        echo "LUN $lun is replaced entirely; the firmware on the other LUNs is kept."
-    else
-        echo "Firmware partitions are kept."
-    fi
-    echo "The current OS on the board will be ERASED."
-    if [ "$assume_yes" -eq 0 ]; then
-        local answer=""
-        ask "Type 'yes' to continue: " answer
-        [ "$answer" = yes ] || die "aborted"
-    fi
 
-    # The programmer reset the board after the read; it comes back in EDL
-    # mode while the EDL jumper or switch is still set.
-    wait_for_edl
+    wait_for_edl_reconnect
     info "Flashing (this takes a while; do not disconnect the board)"
     # The partitions first, the new partition table last.
     {
@@ -890,8 +907,18 @@ flash_qdl() {
         qdl_program_line "$work" PrimaryGPT gpt-main.bin 0 "$ss" "$lun"
         printf '</data>\n'
     } > "$work/rawprogram.xml"
-    (cd "$work" && "$QDL" --storage "$storage" "$prog" rawprogram.xml) \
-        || die "qdl failed while flashing; re-run VFlasher, or restore the vendor image with its own flasher"
+    # Retrying is safe: the job rewrites the same partitions and writes the
+    # partition table last, so a run cut short is simply done again.
+    local attempt
+    for attempt in 1 2 3; do
+        if (cd "$work" && "$QDL" --storage "$storage" "$prog" rawprogram.xml); then
+            break
+        fi
+        [ "$attempt" -lt 3 ] || die "qdl failed while flashing; re-run VFlasher, or restore the vendor image with its own flasher"
+        warn "qdl lost the board (attempt $attempt of 3); waiting for it to come back in EDL mode."
+        warn "if it does not, power-cycle the board with the EDL switch or jumper still set."
+        wait_for_edl_reconnect
+    done
 
     info "Done. ${CONF[NAME]} is on the board."
     echo "Take the board out of EDL mode (jumper or switch) and power-cycle it."

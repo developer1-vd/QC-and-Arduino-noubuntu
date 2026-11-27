@@ -162,8 +162,20 @@ public sealed class QdlFlashJob(
                 new("BackupGPT", Path.GetFileName(backup), plan.BackupStart),
                 new("PrimaryGPT", Path.GetFileName(main), 0),
             ]);
-            await RunQdlAsync(work, [.. Common(storage), "rawprogram.xml"],
-                "qdl failed while flashing; try again, or restore the vendor image with its own flasher", ct);
+            // Retrying is safe: the job rewrites the same partitions and writes the
+            // partition table last. A board can drop off USB during the handshake.
+            for (var attempt = 1; ; attempt++)
+            {
+                var code = await qdl.RunAsync([.. Common(storage), "rawprogram.xml"], work, ui.Log, ct);
+                if (code == 0)
+                    break;
+                if (attempt == MaxFlashAttempts)
+                    throw new IOException(
+                        $"qdl failed while flashing; try again, or restore the vendor image with its own flasher (qdl exit code {code})");
+                ui.Log($"qdl lost the board (attempt {attempt} of {MaxFlashAttempts}); waiting for it to come back in EDL mode. " +
+                       "If it does not, power-cycle the board with the EDL switch or jumper still set.");
+                await edl.WaitForReconnectAsync(ct);
+            }
 
             ui.Log($"Done. {m.Name} is on the board.");
             ui.Log("Remove the EDL jumper and power-cycle the board.");
@@ -177,6 +189,7 @@ public sealed class QdlFlashJob(
     }
 
     const string Programmer = "prog_firehose_ddr.elf";
+    public const int MaxFlashAttempts = 3;
 
     public const string UnsupportedReason =
         "This board's image has to be rebuilt for its storage's 4096-byte sectors, which needs Linux " +

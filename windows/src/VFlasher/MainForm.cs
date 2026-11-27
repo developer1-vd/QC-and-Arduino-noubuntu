@@ -305,11 +305,11 @@ internal sealed class MainForm : Form, IQdlUserInterface
             $"  {espName}: EFI system partition, at sector {plan.EspStart}\n" +
             $"  boot: /boot (new partition), at sector {plan.BootStart}\n" +
             $"  {rootName}: root, {Gib(plan.RootSectors)}, at sector {plan.RootStart}\n\n" +
-            "Firmware partitions are kept. The current OS on the board will be ERASED.\n\nFlash now?";
+            "Firmware partitions are kept. The current OS on the board will be ERASED.";
+        // Flashing was confirmed before the board was touched; asking again here
+        // would leave the board waiting in EDL mode, which it may not survive.
         Log(text.Replace("\n\n", "\n"));
-        var r = MessageBox.Show(this, text, "Confirm flashing", MessageBoxButtons.YesNo, MessageBoxIcon.Warning,
-            MessageBoxDefaultButton.Button2);
-        return Task.FromResult(r == DialogResult.Yes);
+        return Task.FromResult(true);
     }
 
     async Task FlashDriveAsync()

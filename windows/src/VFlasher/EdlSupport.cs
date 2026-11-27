@@ -47,7 +47,7 @@ internal sealed partial class WindowsEdlDevice : IEdlDevice
         while (IsPresent() && DateTime.UtcNow < gone)
             await Task.Delay(250, ct);
         await WaitForDeviceAsync(ct);
-        await Task.Delay(1000, ct); // let Windows finish binding the driver
+        await Task.Delay(3000, ct); // let the board settle and Windows finish binding the driver
     }
 }
 

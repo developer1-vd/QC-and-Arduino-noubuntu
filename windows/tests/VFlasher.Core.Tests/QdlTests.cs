@@ -390,3 +390,81 @@ public class LayoutTests
         Assert.Contains("Linux vflasher", e.Message);
     }
 }
+
+/// <summary>The job retries when the board drops off USB, like a real IQ-9075 EVK did.</summary>
+public class RetryTests
+{
+    sealed class FlakyQdl(int failures) : IQdlRunner
+    {
+        public int Writes;
+        public Task<int> RunAsync(IReadOnlyList<string> args, string workingDirectory, Action<string> onOutput,
+            CancellationToken ct)
+        {
+            if (args.Contains("read-gpt.xml"))
+            {
+                File.WriteAllBytes(Path.Combine(workingDirectory, "board-gpt.bin"),
+                    QdlFixtures.BoardGpt(QdlFixtures.BoardLayout()));
+                return Task.FromResult(0);
+            }
+            Writes++;
+            return Task.FromResult(Writes <= failures ? 1 : 0);
+        }
+    }
+
+    sealed class CountingEdl : IEdlDevice
+    {
+        public int Reconnects;
+        public Task WaitForDeviceAsync(CancellationToken ct) => Task.CompletedTask;
+        public Task WaitForReconnectAsync(CancellationToken ct) { Reconnects++; return Task.CompletedTask; }
+    }
+
+    sealed class Yes : IQdlUserInterface
+    {
+        public Task<bool> AskForEdlModeAsync(string hint) => Task.FromResult(true);
+        public Task<bool> ConfirmPlanAsync(ImageManifest m, GptPlan p, string e, string r) => Task.FromResult(true);
+        public void Log(string line) { }
+    }
+
+    static (QdlFlashJob, FlakyQdl, CountingEdl, string) Job(int failures)
+    {
+        var (image, _, _, _) = QdlFixtures.FedoraLikeImage();
+        var zst = new ZstdSharp.Compressor().Wrap(image).ToArray();
+        var prog = System.Security.Cryptography.RandomNumberGenerator.GetBytes(4096);
+        var archive = QdlFixtures.ProgrammerArchive("./b/flash/prog_firehose_ddr.elf", prog);
+        var m = ImageManifest.Parse("t", "b", "o", $"""
+            NAME=T
+            IMAGE_URL=https://example.org/i.raw.zst
+            IMAGE_FILE=i.raw.zst
+            IMAGE_SHA256={Convert.ToHexStringLower(System.Security.Cryptography.SHA256.HashData(zst))}
+            IMAGE_FORMAT=raw.zst
+            FLASH_METHOD=qdl
+            QDL_PROGRAMMER_URL=https://example.org/bundle.tar.zst
+            QDL_PROGRAMMER_PATH=./b/flash/prog_firehose_ddr.elf
+            QDL_PROGRAMMER_SHA256={Convert.ToHexStringLower(System.Security.Cryptography.SHA256.HashData(prog))}
+            """);
+        var dir = Directory.CreateTempSubdirectory("vflasher-retry-").FullName;
+        var qdl = new FlakyQdl(failures);
+        var edl = new CountingEdl();
+        var job = new QdlFlashJob(m, new HttpClient(new QdlPieceTests.StaticServer(zst, archive)), dir, qdl, edl, new Yes());
+        return (job, qdl, edl, dir);
+    }
+
+    [Fact]
+    public async Task RetriesFlashingWhenTheBoardDropsOff()
+    {
+        var (job, qdl, edl, dir) = Job(failures: 2);
+        await job.RunAsync(new Progress<TransferProgress>(), CancellationToken.None);
+        Assert.Equal(3, qdl.Writes);
+        Assert.Equal(3, edl.Reconnects); // once after the read, then after each failure
+        Directory.Delete(dir, true);
+    }
+
+    [Fact]
+    public async Task GivesUpAfterThreeAttempts()
+    {
+        var (job, qdl, _, dir) = Job(failures: 3);
+        await Assert.ThrowsAsync<IOException>(() => job.RunAsync(new Progress<TransferProgress>(), CancellationToken.None));
+        Assert.Equal(QdlFlashJob.MaxFlashAttempts, qdl.Writes);
+        Directory.Delete(dir, true);
+    }
+}

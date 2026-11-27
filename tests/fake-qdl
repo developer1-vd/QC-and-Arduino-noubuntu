@@ -12,6 +12,20 @@ set -euo pipefail
 disk="${FAKE_QDL_DISK:?FAKE_QDL_DISK must name a disk image}"
 fail() { echo "fake-qdl: $*" >&2; exit 1; }
 
+# FAKE_QDL_FAIL_WRITES=N: the first N sessions that write fail before writing
+# anything, like a board that drops off USB during the Sahara handshake.
+# The count is kept in $FAKE_QDL_DISK.failures.
+if [ -n "${FAKE_QDL_FAIL_WRITES:-}" ] && grep -q '<program\|^write$' <(for a in "$@"; do
+        if [[ $a == *.xml && -f $a ]]; then cat "$a"; else echo "$a"; fi; done); then
+    count_file="$disk.failures"
+    n=$(cat "$count_file" 2>/dev/null || echo 0)
+    if [ "$n" -lt "$FAKE_QDL_FAIL_WRITES" ]; then
+        echo $((n + 1)) > "$count_file"
+        echo "ERR: SAHARA: failed to read request from device" >&2
+        exit 1
+    fi
+fi
+
 if [ -n "${REAL_QDL:-}" ]; then
     "$REAL_QDL" --dry-run "$@" > /dev/null || fail "real qdl --dry-run rejected: $*"
 fi
