@@ -610,12 +610,55 @@ edl_present() {
     return 1
 }
 
+# Qualcomm USB devices that are present, as "vendor:product" lines.
+qualcomm_usb_devices() {
+    local d
+    for d in /sys/bus/usb/devices/*; do
+        [ -r "$d/idVendor" ] && [ "$(cat "$d/idVendor")" = 05c6 ] && echo "05c6:$(cat "$d/idProduct")"
+    done
+    return 0
+}
+
+# Things on the host that commonly keep qdl from opening an EDL device.
+edl_warnings() {
+    local d drv name
+    for d in /sys/bus/usb/devices/*; do
+        [ -r "$d/idVendor" ] && [ "$(cat "$d/idVendor")" = 05c6 ] && [ "$(cat "$d/idProduct")" = 9008 ] || continue
+        for drv in "$d":*/driver; do
+            [ -e "$drv" ] || continue
+            name="$(basename "$(readlink -f "$drv")")"
+            case "$name" in
+                qcserial|qcaux|option|usb_wwan)
+                    warn "the kernel's $name driver has claimed the board, which can stop qdl."
+                    warn "if qdl fails, run 'sudo modprobe -r $name' and try again." ;;
+            esac
+        done
+    done
+    if command -v systemctl > /dev/null && systemctl is-active --quiet ModemManager 2> /dev/null; then
+        warn "ModemManager is running and may grab the board while qdl works."
+        warn "if qdl fails, run 'sudo systemctl stop ModemManager' and try again."
+    fi
+    return 0
+}
+
 wait_for_edl() {
     [ "${VFLASHER_TEST:-}" = 1 ] && return 0
-    local i
+    local i seen
     for ((i = 0; i < 300; i++)); do
-        edl_present && return 0
+        if edl_present; then
+            edl_warnings
+            return 0
+        fi
         [ "$i" -eq 0 ] && info "Waiting for a board in EDL mode (USB 05c6:9008)..."
+        if [ "$i" -eq 15 ]; then
+            seen="$(qualcomm_usb_devices | sort -u | tr '\n' ' ')"
+            if [ -n "$seen" ]; then
+                warn "a Qualcomm device is connected (${seen% }) but not in EDL mode (05c6:9008)."
+                warn "check the EDL switch or jumper, then power-cycle the board."
+            else
+                warn "no Qualcomm USB device seen yet; check the cable and that it is in the board's USB0 port."
+            fi
+        fi
         sleep 1
     done
     die "no board in EDL mode found after 5 minutes"
