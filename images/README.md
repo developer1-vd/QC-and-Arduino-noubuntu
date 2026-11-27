@@ -45,13 +45,16 @@ Extra keys for `FLASH_METHOD=qdl`:
 | Key | Required | Meaning |
 |---|---|---|
 | `QDL_PROGRAMMER_URL` | yes | Where to get Qualcomm's firehose programmer for the board |
-| `QDL_PROGRAMMER_FORMAT` | no | `tar.zst` (a file inside an archive; default) or `elf` |
+| `QDL_PROGRAMMER_FORMAT` | no | `tar.zst` (a file inside an archive; default), `tar.gz` or `elf` |
 | `QDL_PROGRAMMER_PATH` | for `tar.zst` | Path of the programmer inside the archive |
 | `QDL_PROGRAMMER_SHA256` | yes | SHA-256 of the programmer itself |
 | `QDL_STORAGE` | no | `emmc` (default) or `ufs` |
-| `QDL_ESP_PARTITION` | no | Board partition that receives the EFI partition (default `efi`) |
-| `QDL_ROOT_PARTITION` | no | Last board partition, split into `boot` + root (default `system`) |
-| `QDL_ROOT_TYPE` | no | Partition type for root: `linux` (default) or `lvm` |
+| `QDL_LAYOUT` | no | `keep-firmware` (default): rewrite only the OS partitions at the end of the board's table, as on the VENTUNO Q's eMMC. `whole-lun`: replace a whole LUN that holds only the OS, as on the IQ-9075's UFS LUN 0 |
+| `QDL_LUN` | no | LUN for `whole-lun` (default 0) |
+| `QDL_SECTOR_SIZE` | no | `512` (default) or `4096` (UFS). With 4096, the image's FAT and XFS are rebuilt for 4K sectors (Linux only) |
+| `QDL_ESP_PARTITION` | no | `keep-firmware`: board partition that receives the EFI partition (default `efi`) |
+| `QDL_ROOT_PARTITION` | no | `keep-firmware`: last board partition, split into `boot` + root (default `system`) |
+| `QDL_ROOT_TYPE` | no | `keep-firmware`: partition type for root, `linux` (default) or `lvm` |
 | `EDL_HINT` | no | How to put the board in EDL mode, shown to the user |
 | `FIRST_BOOT` | no | Command to suggest after the first boot |
 

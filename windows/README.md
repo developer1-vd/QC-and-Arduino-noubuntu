@@ -49,6 +49,10 @@ in Qualcomm EDL mode. For these, no drive is picked. Click **Flash**, then:
 This is the same process as the Linux `vflasher` script, and the same code
 plans the partition table: a test checks that both produce identical bytes.
 
+The **Qualcomm IQ-9075 EVK** is listed but can't be flashed from Windows. Its
+UFS uses 4096-byte sectors, and rebuilding Fedora's file systems for that needs
+Linux tools, so use the Linux `vflasher` script for it.
+
 You can also preselect the image from a terminal, like on Linux:
 
 ```

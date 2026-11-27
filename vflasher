@@ -268,8 +268,13 @@ QDL="${VFLASHER_QDL:-qdl}"
 #   plan GPT ESP ROOT BOOT_SECTORS ESP_MIN ROOT_MIN ROOT_TYPE OUTDIR
 #                       board GPT (34 sectors) -> OUTDIR/gpt-main.bin and
 #                       gpt-backup.bin; prints KEY VALUE lines
+#   lun-plan GPT SECTOR_SIZE ESP_BYTES BOOT_BYTES ROOT_BYTES OUTDIR
+#                       a fresh GPT for a whole LUN (efi, boot, system), sized
+#                       from the LUN's current GPT header; prints KEY VALUE lines
+#   find-fs FILE        locate the file system inside a partition (e.g. in an
+#                       LVM volume); prints "TYPE OFFSET BYTES UUID LABEL"
 read -r -d '' PY_HELPER <<'PY' || true
-import struct, sys, uuid, zlib
+import re, struct, sys, uuid, zlib
 
 SECTOR = 512
 MIB = 1 << 20
@@ -277,6 +282,10 @@ ESP_TYPE = uuid.UUID("c12a7328-f81f-11d2-ba4b-00a0c93ec93b")
 XBOOTLDR_TYPE = uuid.UUID("bc13c2ff-59e6-4262-a352-b275fd6f7172")
 LVM_TYPE = uuid.UUID("e6d6d379-f507-44c2-a23c-238f2a3df928")
 LINUX_TYPE = uuid.UUID("0fc63daf-8483-4772-8e79-3d69d8477de4")
+ROOT_ARM64_TYPE = uuid.UUID("b921b045-1df0-41c3-af44-4c6f280d3fae")
+# Qualcomm firmware partitions: a LUN holding any of these is never replaced.
+FIRMWARE_RE = re.compile(r"^(xbl|xbl_config|xbl_ramdump|uefi|uefisecapp|tz|hyp|aop|cdt|ddr|devcfg|abl|"
+                         r"keymaster|shrm|cpucp|qupfw|multiimgoem|multiimgqti|imagefv|dtb|sail\w*|SAIL\w*)(_[ab])?$")
 HDR = struct.Struct("<8sIIIIQQQQ16sQIII")
 ENT = struct.Struct("<16s16sQQQ72s")
 
@@ -355,11 +364,97 @@ def name_of(e):
     return e[5].decode("utf-16-le").rstrip("\0")
 
 
-def header_bytes(fields):
+def header_bytes(fields, sector=SECTOR):
     h = bytearray(HDR.pack(*fields))
     struct.pack_into("<I", h, 16, 0)
     struct.pack_into("<I", h, 16, crc(h))
-    return bytes(h) + bytes(SECTOR - HDR.size)
+    return bytes(h) + bytes(sector - HDR.size)
+
+
+def lun_plan(gpt_file, ss, esp_bytes, boot_bytes, root_bytes, outdir):
+    ss, esp_bytes, boot_bytes, root_bytes = int(ss), int(esp_bytes), int(boot_bytes), int(root_bytes)
+    d = open(gpt_file, "rb").read()
+    if len(d) < 2 * ss:
+        fail("the partition table read from the board is too short")
+    h = list(HDR.unpack_from(d, ss))
+    sig, _, hsize, hcrc, _, my_lba, alt_lba, _, _, _, ent_lba, n, esz, ecrc = h
+    if sig != b"EFI PART" or hsize != 92 or my_lba != 1 or esz != 128:
+        fail("the board's LUN has no valid GPT; flash the vendor image once first")
+    check = bytearray(d[ss:ss + 92])
+    struct.pack_into("<I", check, 16, 0)
+    if crc(check) != hcrc:
+        fail("the board's GPT header checksum is wrong")
+    if ent_lba * ss + n * esz > len(d):
+        fail("the partition table read from the board is too short")
+    raw = d[ent_lba * ss: ent_lba * ss + n * esz]
+    if crc(raw) != ecrc:
+        fail("the board's GPT entry checksum is wrong")
+    names = [name_of(ENT.unpack_from(raw, i * esz)) for i in range(n)
+             if raw[i * esz: i * esz + 16] != bytes(16)]
+    firmware = [x for x in names if FIRMWARE_RE.match(x)]
+    if firmware:
+        fail(f"this LUN holds firmware partitions ({', '.join(firmware)}); not replacing it")
+
+    ent_sectors = (n * esz + ss - 1) // ss
+    first, last = 2 + ent_sectors, alt_lba - ent_sectors - 1
+    align = max(1, MIB // ss)
+    up = lambda x: (x + align - 1) // align * align
+    secs = lambda b: (b + ss - 1) // ss
+    esp_start = up(first)
+    boot_start = up(esp_start + secs(esp_bytes))
+    root_start = up(boot_start + secs(boot_bytes))
+    if last - root_start + 1 < secs(root_bytes):
+        fail("the LUN is too small for this image")
+
+    parts = [(ESP_TYPE, esp_start, esp_start + secs(esp_bytes) - 1, "efi"),
+             (XBOOTLDR_TYPE, boot_start, boot_start + secs(boot_bytes) - 1, "boot"),
+             (ROOT_ARM64_TYPE, root_start, last, "system")]
+    ents = bytearray(ent_sectors * ss)
+    for i, (t, a, b, name) in enumerate(parts):
+        ENT.pack_into(ents, i * esz, t.bytes_le, uuid.uuid4().bytes_le, a, b, 0,
+                      name.encode("utf-16-le").ljust(72, b"\0"))
+    ecrc = crc(bytes(ents[: n * esz]))
+    disk_guid = uuid.uuid4().bytes_le
+    fields = [b"EFI PART", 0x10000, 92, 0, 0, 1, alt_lba, first, last, disk_guid, 2, n, esz, ecrc]
+    pmbr = bytearray(ss)
+    struct.pack_into("<B3xB3xII", pmbr, 446, 0, 0xEE, 1, min(alt_lba, 0xFFFFFFFF))
+    pmbr[446 + 1:446 + 4] = b"\x00\x02\x00"
+    pmbr[446 + 5:446 + 8] = b"\xff\xff\xff"
+    pmbr[510:512] = b"\x55\xaa"
+    primary = bytes(pmbr) + header_bytes(fields, ss) + bytes(ents)
+    b = list(fields)
+    b[5], b[6], b[10] = alt_lba, 1, alt_lba - ent_sectors
+    backup = bytes(ents) + header_bytes(b, ss)
+    open(f"{outdir}/gpt-main.bin", "wb").write(primary)
+    open(f"{outdir}/gpt-backup.bin", "wb").write(backup)
+    print("ESP_START", esp_start)
+    print("BOOT_START", boot_start)
+    print("ROOT_START", root_start)
+    print("ROOT_SECTORS", last - root_start + 1)
+    print("BACKUP_START", alt_lba - ent_sectors)
+    print("DISK_SECTORS", alt_lba + 1)
+
+
+def find_fs(path):
+    with open(path, "rb") as f:
+        for off in range(0, 64 * MIB, 4096):
+            f.seek(off)
+            sb = f.read(2048)
+            if len(sb) < 2048:
+                break
+            if sb[:4] == b"XFSB":
+                bsize = struct.unpack_from(">I", sb, 4)[0]
+                dblocks = struct.unpack_from(">Q", sb, 8)[0]
+                label = sb[108:120].rstrip(b"\0").decode(errors="replace") or "-"
+                print("xfs", off, bsize * dblocks, uuid.UUID(bytes=sb[32:48]), label)
+                return
+            if struct.unpack_from("<H", sb, 1024 + 56)[0] == 0xEF53:
+                blocks = struct.unpack_from("<I", sb, 1024 + 4)[0]
+                bsize = 1024 << struct.unpack_from("<I", sb, 1024 + 24)[0]
+                label = sb[1024 + 120:1024 + 136].rstrip(b"\0").decode(errors="replace") or "-"
+                print("ext4", off, blocks * bsize, uuid.UUID(bytes=sb[1024 + 104:1024 + 120]), label)
+                return
+    fail(f"no file system found in {path}")
 
 
 def plan(gpt_file, esp_name, root_name, boot_sectors, esp_min, root_min, root_type, outdir):
@@ -457,6 +552,10 @@ if sys.argv[1] == "split":
     split(sys.argv[2])
 elif sys.argv[1] == "plan":
     plan(*sys.argv[2:10])
+elif sys.argv[1] == "lun-plan":
+    lun_plan(*sys.argv[2:8])
+elif sys.argv[1] == "find-fs":
+    find_fs(sys.argv[2])
 else:
     fail("unknown helper command")
 PY
@@ -476,12 +575,17 @@ fetch_programmer() {
     fi
     part="$file.part"
     local host="${CONF[QDL_PROGRAMMER_URL]#*//}"
-    info "Fetching the Qualcomm firehose programmer from ${host%%/*}" >&2
+    host="${host%%/*}"
+    info "Fetching the Qualcomm firehose programmer from ${host:-a local file}" >&2
     case "${CONF[QDL_PROGRAMMER_FORMAT]:-tar.zst}" in
         tar.zst)
             need zstd; need tar
             # tar stops once it has the file, which cuts the download short.
             (curl -fsSL "${CONF[QDL_PROGRAMMER_URL]}" | zstd -dcq \
+                | tar -xO --occurrence=1 "${CONF[QDL_PROGRAMMER_PATH]}") > "$part" 2>/dev/null || true ;;
+        tar.gz)
+            need gzip; need tar
+            (curl -fsSL "${CONF[QDL_PROGRAMMER_URL]}" | gzip -dc \
                 | tar -xO --occurrence=1 "${CONF[QDL_PROGRAMMER_PATH]}") > "$part" 2>/dev/null || true ;;
         elf)
             curl -fsSL -o "$part" "${CONF[QDL_PROGRAMMER_URL]}" || true ;;
@@ -539,19 +643,112 @@ add_devicetree_to_esp() {
 # qdl job files (Qualcomm rawprogram*.xml format), as Arduino's flasher uses.
 # They state the sector size, so qdl need not detect it. The C# app writes the
 # same files (windows/src/VFlasher.Core/Qdl/QdlJobXml.cs).
-qdl_read_job() { # FILE START SECTORS
-    printf '<?xml version="1.0" ?>\n<data>\n  <read SECTOR_SIZE_IN_BYTES="512" filename="%s" physical_partition_number="0" num_partition_sectors="%s" start_sector="%s"/>\n</data>\n' "$1" "$3" "$2"
+qdl_read_job() { # FILE START SECTORS [SECTOR_SIZE] [LUN]
+    printf '<?xml version="1.0" ?>\n<data>\n  <read SECTOR_SIZE_IN_BYTES="%s" filename="%s" physical_partition_number="%s" num_partition_sectors="%s" start_sector="%s"/>\n</data>\n' "${4:-512}" "$1" "${5:-0}" "$3" "$2"
 }
 
-qdl_program_line() { # DIR LABEL FILE START
-    local sectors=$(( ($(stat -c %s "$1/$3") + 511) / 512 ))
-    printf '  <program SECTOR_SIZE_IN_BYTES="512" file_sector_offset="0" filename="%s" label="%s" num_partition_sectors="%s" physical_partition_number="0" sparse="false" start_sector="%s"/>\n' "$3" "$2" "$sectors" "$4"
+qdl_program_line() { # DIR LABEL FILE START [SECTOR_SIZE] [LUN]
+    local ss="${5:-512}"
+    local sectors=$(( ($(stat -c %s "$1/$3") + ss - 1) / ss ))
+    printf '  <program SECTOR_SIZE_IN_BYTES="%s" file_sector_offset="0" filename="%s" label="%s" num_partition_sectors="%s" physical_partition_number="%s" sparse="false" start_sector="%s"/>\n' "$ss" "$3" "$2" "$sectors" "${6:-0}" "$4"
+}
+
+# Undo mounts and loop devices of a work folder, then delete it.
+qdl_cleanup() {
+    local work="$1" m f
+    for m in "$work"/mnt-*; do
+        if mountpoint -q "$m" 2>/dev/null; then umount "$m" 2>/dev/null || umount -l "$m" 2>/dev/null || true; fi
+    done
+    for f in "$work"/*.img; do
+        [ -e "$f" ] || continue
+        losetup -j "$f" 2>/dev/null | cut -d: -f1 | while read -r l; do losetup -d "$l" 2>/dev/null || true; done
+    done
+    rm -rf --one-file-system "$work"
+}
+
+# Replace a file's contents in place, keeping its inode (and so its SELinux label).
+rewrite_file() { # FILE SED_SCRIPT
+    [ -f "$1" ] || return 0
+    sed -E "$2" "$1" > "$1.vflasher-tmp" && cat "$1.vflasher-tmp" > "$1" && rm -f "$1.vflasher-tmp"
+}
+
+# Rebuild the image's partitions for storage with SS-byte sectors (UFS uses
+# 4096). FAT and XFS made for 512-byte sectors cannot be mounted on such a
+# device; ext4 with 4K blocks works as is. Root on LVM becomes a plain XFS
+# partition with the same UUID (no volume group that could clash with the
+# host's), set to grow to the whole partition on first boot.
+rebuild_for_sector_size() { # WORK SS
+    local work="$1" ss="$2"
+    local t
+    for t in mkfs.vfat mkfs.xfs mcopy minfo losetup mount umount mountpoint; do need "$t"; done
+    local mold="$work/mnt-old" mnew="$work/mnt-new" mboot="$work/mnt-boot"
+    mkdir -p "$mold" "$mnew" "$mboot"
+
+    info "Rebuilding the EFI partition for ${ss}-byte sectors"
+    local info serial label size
+    info="$(MTOOLS_SKIP_CHECK=1 minfo -i "$work/p1.img" ::)"
+    serial="$(awk -F': ' '/serial number/ { print $2 }' <<<"$info")"
+    label="$(sed -n 's/.*disk label="\([^"]*\)".*/\1/p' <<<"$info" | sed 's/ *$//')"
+    [[ $serial =~ ^[0-9A-Fa-f]{8}$ ]] || die "could not read the EFI partition's serial number"
+    mkdir -p "$work/esp-files"
+    MTOOLS_SKIP_CHECK=1 mcopy -s -i "$work/p1.img" '::/*' "$work/esp-files/"
+    size=$(stat -c %s "$work/p1.img")
+    rm -f "$work/p1.img"
+    truncate -s "$size" "$work/p1.img"
+    # One sector per cluster; more than 65524 clusters needs FAT32.
+    local fat=()
+    [ $(( size / ss )) -gt 65524 ] && fat=(-F 32)
+    mkfs.vfat -S "$ss" -s 1 "${fat[@]}" -i "$serial" ${label:+-n "$label"} "$work/p1.img" > /dev/null
+    MTOOLS_SKIP_CHECK=1 mcopy -s -i "$work/p1.img" "$work/esp-files/"* ::/
+    rm -rf "$work/esp-files"
+
+    info "Rebuilding the root file system for ${ss}-byte sectors"
+    local fs off fsize uuid fslabel
+    read -r fs off fsize uuid fslabel < <(py_helper find-fs "$work/p3.img")
+    [ "$fs" = xfs ] || die "unsupported root file system '${fs:-none}' (expected XFS)"
+    [ "$fslabel" = - ] && fslabel=""
+    local old
+    old="$(losetup -f --show -r -o "$off" --sizelimit "$fsize" "$work/p3.img")"
+    # nouuid: the old and new file system share a UUID while both are mounted.
+    mount -o ro,norecovery,nouuid "$old" "$mold" || die "could not mount the image's root file system"
+    truncate -s $(( (fsize + ss - 1) / ss * ss )) "$work/root.img"
+    mkfs.xfs -q -f -s size="$ss" -m uuid="$uuid" ${fslabel:+-L "$fslabel"} "$work/root.img"
+    mount -o loop,nouuid "$work/root.img" "$mnew" || die "could not mount the new root file system"
+    cp -a --preserve=all "$mold/." "$mnew/" || die "copying the root file system failed"
+
+    # Point everything that named the LVM volume at the file system's UUID.
+    local old_root mapper=""
+    old_root="$(awk '$1 !~ /^#/ && $2 == "/" { print $1 }' "$mnew/etc/fstab")"
+    if [[ $old_root =~ ^/dev/([^/]+)/([^/]+)$ && ${BASH_REMATCH[1]} != mapper ]]; then
+        local vg="${BASH_REMATCH[1]}" lv="${BASH_REMATCH[2]}"
+        mapper="/dev/mapper/${vg//-/--}-${lv//-/--}"
+    fi
+    local fix="s# ?rd\.lvm\.lv=[^ \"]+##g"
+    [ -n "$old_root" ] && fix="$fix; s#root=${old_root}( |\"|\$)#root=UUID=${uuid}\1#g"
+    [ -n "$mapper" ] && fix="$fix; s#root=${mapper}( |\"|\$)#root=UUID=${uuid}\1#g"
+    awk -v u="UUID=$uuid" '$1 !~ /^#/ && $2 == "/" { $1 = u; if ($4 !~ /x-systemd\.growfs/) $4 = $4 ",x-systemd.growfs" } { print }' \
+        "$mnew/etc/fstab" > "$work/fstab.new" && cat "$work/fstab.new" > "$mnew/etc/fstab"
+    rewrite_file "$mnew/etc/kernel/cmdline" "$fix"
+    rm -f "$mnew/etc/lvm/devices/system.devices" "$mnew/etc/lvm/devices/auto-import-rootvg"
+    umount "$mnew"; umount "$mold"; losetup -d "$old"
+    mv "$work/root.img" "$work/p3.img"
+
+    mount -o loop "$work/p2.img" "$mboot" || die "could not mount the image's /boot"
+    rewrite_file "$mboot/grub2/grub.cfg" "$fix"
+    for t in "$mboot"/loader/entries/*.conf; do rewrite_file "$t" "$fix"; done
+    umount "$mboot"
 }
 
 flash_qdl() {
     local image="$1" assume_yes="$2"
     local storage="${CONF[QDL_STORAGE]:-emmc}" esp_name="${CONF[QDL_ESP_PARTITION]:-efi}"
     local root_name="${CONF[QDL_ROOT_PARTITION]:-system}"
+    local layout="${CONF[QDL_LAYOUT]:-keep-firmware}" ss="${CONF[QDL_SECTOR_SIZE]:-512}" lun="${CONF[QDL_LUN]:-0}"
+    case "$layout" in
+        keep-firmware) [ "$ss" = 512 ] || die "QDL_LAYOUT=keep-firmware needs QDL_SECTOR_SIZE=512" ;;
+        whole-lun) [[ $ss =~ ^(512|4096)$ && $lun =~ ^[0-9]$ ]] || die "bad QDL_SECTOR_SIZE or QDL_LUN" ;;
+        *) die "unknown QDL_LAYOUT '$layout'" ;;
+    esac
     local n
     for n in "$storage" "$esp_name" "$root_name"; do
         [[ $n =~ ^[A-Za-z0-9_.-]+$ ]] || die "invalid partition or storage name '$n' in manifest"
@@ -565,7 +762,7 @@ flash_qdl() {
     local work
     work="$(mktemp -d "$(cache_dir)/work.XXXXXX")"
     # shellcheck disable=SC2064
-    trap "rm -rf '$work'" EXIT
+    trap "qdl_cleanup '$work'" EXIT
 
     info "Unpacking the image's partitions"
     local unpack; unpack="$(decompress_cmd)"
@@ -577,6 +774,10 @@ flash_qdl() {
     done < <($unpack "$image" | py_helper split "$work")
     [ ${#parts[@]} -eq 3 ] || die "expected an image with 3 partitions (EFI, /boot, root), found ${#parts[@]}"
     local esp_sectors="${parts[0]#*:}" boot_sectors="${parts[1]#*:}" root_sectors="${parts[2]#*:}"
+
+    if [ "$ss" != 512 ]; then
+        rebuild_for_sector_size "$work" "$ss"
+    fi
 
     if [ -n "${CONF[DTB]:-}" ]; then
         info "Setting the device tree to ${CONF[DTB]}"
@@ -595,23 +796,37 @@ flash_qdl() {
     wait_for_edl
 
     info "Reading the board's partition table"
-    qdl_read_job board-gpt.bin 0 34 > "$work/read-gpt.xml"
+    local read_sectors=34
+    [ "$layout" = whole-lun ] && read_sectors=$(( 2 + (16384 + ss - 1) / ss ))
+    qdl_read_job board-gpt.bin 0 "$read_sectors" "$ss" "$lun" > "$work/read-gpt.xml"
     (cd "$work" && "$QDL" --storage "$storage" "$prog" read-gpt.xml) \
         || die "qdl could not read the board (is it in EDL mode?)"
 
     local -A plan=()
     local key val
-    while read -r key val; do plan[$key]="$val"; done < <(
-        py_helper plan "$work/board-gpt.bin" "$esp_name" "$root_name" \
-            "$boot_sectors" "$esp_sectors" "$root_sectors" "${CONF[QDL_ROOT_TYPE]:-linux}" "$work")
+    if [ "$layout" = whole-lun ]; then
+        esp_name=efi root_name=system
+        while read -r key val; do plan[$key]="$val"; done < <(
+            py_helper lun-plan "$work/board-gpt.bin" "$ss" "$(stat -c %s "$work/p1.img")" \
+                "$(stat -c %s "$work/p2.img")" "$(stat -c %s "$work/p3.img")" "$work")
+    else
+        while read -r key val; do plan[$key]="$val"; done < <(
+            py_helper plan "$work/board-gpt.bin" "$esp_name" "$root_name" \
+                "$boot_sectors" "$esp_sectors" "$root_sectors" "${CONF[QDL_ROOT_TYPE]:-linux}" "$work")
+    fi
     [ -n "${plan[ROOT_START]:-}" ] || die "could not plan the new partition layout"
 
     echo
     echo "VFlasher will write ${CONF[NAME]} to the board's $storage:"
     printf '  %-8s at sector %-10s (%s)\n' "$esp_name" "${plan[ESP_START]}" "EFI system partition" \
-        boot "${plan[BOOT_START]}" "/boot, new partition" \
-        "$root_name" "${plan[ROOT_START]}" "root, $(( plan[ROOT_SECTORS] / 2048 / 1024 )) GiB"
-    echo "Firmware partitions are kept. The current OS on the board will be ERASED."
+        boot "${plan[BOOT_START]}" "/boot" \
+        "$root_name" "${plan[ROOT_START]}" "root, $(( plan[ROOT_SECTORS] * ss / 1024 / 1024 / 1024 )) GiB"
+    if [ "$layout" = whole-lun ]; then
+        echo "LUN $lun is replaced entirely; the firmware on the other LUNs is kept."
+    else
+        echo "Firmware partitions are kept."
+    fi
+    echo "The current OS on the board will be ERASED."
     if [ "$assume_yes" -eq 0 ]; then
         local answer=""
         ask "Type 'yes' to continue: " answer
@@ -619,24 +834,24 @@ flash_qdl() {
     fi
 
     # The programmer reset the board after the read; it comes back in EDL
-    # mode while the EDL jumper is still fitted.
+    # mode while the EDL jumper or switch is still set.
     wait_for_edl
     info "Flashing (this takes a while; do not disconnect the board)"
     # The partitions first, the new partition table last.
     {
         printf '<?xml version="1.0" ?>\n<data>\n'
-        qdl_program_line "$work" "$esp_name" p1.img "${plan[ESP_START]}"
-        qdl_program_line "$work" boot p2.img "${plan[BOOT_START]}"
-        qdl_program_line "$work" "$root_name" p3.img "${plan[ROOT_START]}"
-        qdl_program_line "$work" BackupGPT gpt-backup.bin "${plan[BACKUP_START]}"
-        qdl_program_line "$work" PrimaryGPT gpt-main.bin 0
+        qdl_program_line "$work" "$esp_name" p1.img "${plan[ESP_START]}" "$ss" "$lun"
+        qdl_program_line "$work" boot p2.img "${plan[BOOT_START]}" "$ss" "$lun"
+        qdl_program_line "$work" "$root_name" p3.img "${plan[ROOT_START]}" "$ss" "$lun"
+        qdl_program_line "$work" BackupGPT gpt-backup.bin "${plan[BACKUP_START]}" "$ss" "$lun"
+        qdl_program_line "$work" PrimaryGPT gpt-main.bin 0 "$ss" "$lun"
         printf '</data>\n'
     } > "$work/rawprogram.xml"
     (cd "$work" && "$QDL" --storage "$storage" "$prog" rawprogram.xml) \
         || die "qdl failed while flashing; re-run VFlasher, or restore the vendor image with its own flasher"
 
     info "Done. ${CONF[NAME]} is on the board."
-    echo "Remove the EDL jumper and power-cycle the board."
+    echo "Take the board out of EDL mode (jumper or switch) and power-cycle it."
     if [ -n "${CONF[FIRST_BOOT]:-}" ]; then
         echo "After the first login, run this to use the whole $storage:"
         echo "  ${CONF[FIRST_BOOT]}"

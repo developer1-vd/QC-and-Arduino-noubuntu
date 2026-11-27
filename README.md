@@ -12,7 +12,7 @@ Currently supported:
 
 | Manufacturer | Board | OS | How it is flashed |
 |---|---|---|---|
-| qualcomm | [iq9075-evk](images/qualcomm/iq9075-evk/fedora/) | fedora | to a USB/NVMe/SD drive (Linux or Windows) |
+| qualcomm | [iq9075-evk](images/qualcomm/iq9075-evk/fedora/) | fedora | to the on-board UFS over USB in EDL mode (Linux) |
 | arduino | [ventuno-q](images/arduino/ventuno-q/fedora/) | fedora | to the on-board eMMC over USB-C in EDL mode (Linux or Windows) |
 
 ---

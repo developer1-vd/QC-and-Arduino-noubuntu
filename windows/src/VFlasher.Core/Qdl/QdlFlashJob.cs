@@ -89,6 +89,8 @@ public sealed class QdlFlashJob(
         var m = manifest;
         if (m.FlashMethod != "qdl")
             throw new InvalidOperationException("not a qdl image");
+        if (!SupportsLayout(m))
+            throw new NotSupportedException(UnsupportedReason);
         var storage = m.Get("QDL_STORAGE") ?? "emmc";
         var espName = m.Get("QDL_ESP_PARTITION") ?? "efi";
         var rootName = m.Get("QDL_ROOT_PARTITION") ?? "system";
@@ -175,6 +177,17 @@ public sealed class QdlFlashJob(
     }
 
     const string Programmer = "prog_firehose_ddr.elf";
+
+    public const string UnsupportedReason =
+        "This board's image has to be rebuilt for its storage's 4096-byte sectors, which needs Linux " +
+        "file system tools. Flash it with the Linux vflasher script.";
+
+    /// <summary>
+    /// The Windows app does the keep-firmware layout (e.g. the VENTUNO Q's eMMC).
+    /// Whole-LUN images with 4K sectors (the IQ-9075's UFS) need the Linux script.
+    /// </summary>
+    public static bool SupportsLayout(ImageManifest m) =>
+        (m.Get("QDL_LAYOUT") ?? "keep-firmware") == "keep-firmware" && (m.Get("QDL_SECTOR_SIZE") ?? "512") == "512";
 
     static string[] Common(string storage) => ["--storage", storage, Programmer];
 

@@ -167,7 +167,11 @@ internal sealed class MainForm : Form, IQdlUserInterface
         if (m == null) { imageInfo.Text = ""; UpdateButtons(); return; }
         var size = m.ImageSize is { } s ? $", {DiskInfo.FormatSize(s)} download" : "";
         imageInfo.Text = $"{m.Name}{size}\nSource: {m.ImageUrl.Host}";
-        if (m.FlashMethod == "qdl")
+        if (m.FlashMethod == "qdl" && !QdlFlashJob.SupportsLayout(m))
+        {
+            imageInfo.Text += "\n" + QdlFlashJob.UnsupportedReason;
+        }
+        else if (m.FlashMethod == "qdl")
         {
             imageInfo.Text += "\nThis board is flashed over USB-C in EDL mode: no drive is needed. " +
                               "Its firmware partitions are kept; the OS on the board is replaced.";
@@ -204,7 +208,7 @@ internal sealed class MainForm : Form, IQdlUserInterface
         flashButton.Enabled = !busy && SelectedManifest switch
         {
             { FlashMethod: "dd" } => SelectedDisk != null,
-            { FlashMethod: "qdl" } => QdlTool.Path != null,
+            { FlashMethod: "qdl" } m => QdlTool.Path != null && QdlFlashJob.SupportsLayout(m),
             _ => false,
         };
         cancelButton.Enabled = busy;

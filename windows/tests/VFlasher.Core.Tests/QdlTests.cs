@@ -372,3 +372,21 @@ public class RealProgrammerTests
         protected override void Dispose(bool disposing) { if (disposing) inner.Dispose(); base.Dispose(disposing); }
     }
 }
+
+public class LayoutTests
+{
+    [Fact]
+    public async Task WindowsRefusesWholeLunImages()
+    {
+        var images = ManifestCatalog.LoadLocal(ManifestCatalog.FindLocalImagesDir(AppContext.BaseDirectory)!);
+        var iq9 = images.Single(m => m.Id == "qualcomm/iq9075-evk/fedora");
+        var ventuno = images.Single(m => m.Id == "arduino/ventuno-q/fedora");
+        Assert.False(QdlFlashJob.SupportsLayout(iq9));
+        Assert.True(QdlFlashJob.SupportsLayout(ventuno));
+
+        var job = new QdlFlashJob(iq9, new HttpClient(), Path.GetTempPath(), null!, null!, null!);
+        var e = await Assert.ThrowsAsync<NotSupportedException>(() =>
+            job.RunAsync(new Progress<TransferProgress>(), CancellationToken.None));
+        Assert.Contains("Linux vflasher", e.Message);
+    }
+}

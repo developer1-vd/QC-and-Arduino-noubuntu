@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Stand-in for qdl, used by the tests: runs qdl's commands against a disk-image
-# file ($FAKE_QDL_DISK) instead of a board. Understands qdl job files
+# file ($FAKE_QDL_DISK, the board's LUN 0) instead of a board. Sector sizes of
+# 512 (eMMC) and 4096 (UFS) bytes are supported. Understands qdl job files
 # (<read>/<program> XML, checked for every attribute qdl v2.4 requires) and the
 # raw "read"/"write" commands.
 #
@@ -17,7 +18,7 @@ fi
 
 while [[ ${1:-} == --* ]]; do
     case "$1" in
-        --storage) [ "$2" = emmc ] || fail "unexpected storage $2"; shift 2 ;;
+        --storage) [[ $2 =~ ^(emmc|ufs)$ ]] || fail "unexpected storage $2"; shift 2 ;;
         *) shift ;;
     esac
 done
@@ -43,7 +44,7 @@ while args:
     if a in ("read", "write"):
         if len(args) < 2:
             fail(f"incomplete command {a}")
-        out.append((a, args.pop(0), args.pop(0)))
+        out.append((a, args.pop(0), args.pop(0), "512"))
         continue
     if not a.endswith(".xml"):
         fail(f"unexpected argument {a}")
@@ -57,34 +58,35 @@ while args:
         if missing:
             fail(f"{a}: <{el.tag}> lacks {missing}")
         at = el.attrib
-        if at["SECTOR_SIZE_IN_BYTES"] != "512" or at["physical_partition_number"] != "0":
+        ss = at["SECTOR_SIZE_IN_BYTES"]
+        if ss not in ("512", "4096") or at["physical_partition_number"] != "0":
             fail(f"{a}: unexpected sector size or LUN")
         if el.tag == "read":
-            out.append(("read", f"0/{at['start_sector']}+{at['num_partition_sectors']}", at["filename"]))
+            out.append(("read", f"0/{at['start_sector']}+{at['num_partition_sectors']}", at["filename"], ss))
         else:
             if at["sparse"] != "false" or at["file_sector_offset"] != "0":
                 fail(f"{a}: unexpected sparse/file_sector_offset")
             size = os.path.getsize(at["filename"])
-            if int(at["num_partition_sectors"]) != (size + 511) // 512:
+            if int(at["num_partition_sectors"]) != (size + int(ss) - 1) // int(ss):
                 fail(f"{a}: num_partition_sectors does not match {at['filename']}")
-            out.append(("write", f"0/{at['start_sector']}", at["filename"]))
+            out.append(("write", f"0/{at['start_sector']}", at["filename"], ss))
 for op in out:
     print(*op)
 PY
 )"
 
-while read -r cmd addr file; do
+while read -r cmd addr file ss; do
     [[ $addr =~ ^0/([0-9]+)(\+([0-9]+))?$ ]] || fail "bad address $addr"
     start="${BASH_REMATCH[1]}" count="${BASH_REMATCH[3]}"
     case "$cmd" in
         read)
             [ -n "$count" ] || fail "read needs N/S+L"
-            dd if="$disk" of="$file" bs=512 skip="$start" count="$count" status=none ;;
+            dd if="$disk" of="$file" bs="$ss" skip="$start" count="$count" status=none ;;
         write)
             size=$(stat -c %s "$file")
-            [ $((size % 512)) -eq 0 ] || fail "$file is not whole sectors"
-            [ $((start * 512 + size)) -le "$(stat -c %s "$disk")" ] || fail "write past end of disk"
-            dd if="$file" of="$disk" bs=1M oflag=seek_bytes seek=$((start * 512)) conv=notrunc status=none ;;
+            [ $((size % ss)) -eq 0 ] || fail "$file is not whole sectors"
+            [ $((start * ss + size)) -le "$(stat -c %s "$disk")" ] || fail "write past end of disk"
+            dd if="$file" of="$disk" bs=1M oflag=seek_bytes seek=$((start * ss)) conv=notrunc status=none ;;
     esac
     echo "$cmd $addr $(basename "$file")" >> "${FAKE_QDL_LOG:-/dev/null}"
 done <<< "$ops"

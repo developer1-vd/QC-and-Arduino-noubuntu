@@ -20,7 +20,7 @@ jobs:
       - name: Check vflasher script
         run: |
           bash -n vflasher
-          shellcheck vflasher tests/fake-qdl tests/test-qdl-flash.sh
+          shellcheck vflasher tests/fake-qdl tests/test-qdl-flash.sh tests/test-ufs-flash.sh
           ./vflasher --list
       - name: Get the real qdl v2.4 (Linux build of the version VFlasher ships)
         run: |
@@ -33,8 +33,11 @@ jobs:
       - name: EDL/qdl flashing test (fake board, jobs checked by real qdl)
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq gdisk mtools zstd
+          sudo apt-get install -y -qq gdisk mtools zstd dosfstools xfsprogs attr
           tests/test-qdl-flash.sh
+      # Mounts file systems, so it runs as root.
+      - name: 4K-sector UFS flashing test (IQ-9075 layout, jobs checked by real qdl)
+        run: sudo --preserve-env=REAL_QDL tests/test-ufs-flash.sh
       - name: Core tests (C# EDL job checked by real qdl too)
         run: dotnet test windows/tests/VFlasher.Core.Tests
 
