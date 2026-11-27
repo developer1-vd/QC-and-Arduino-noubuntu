@@ -32,6 +32,10 @@ Options:
                       If omitted, VFlasher lists drives and asks.
                       Not used for boards flashed over USB in EDL mode.
   -y, --yes           Do not ask for confirmation before writing.
+      --boot-log      Show the whole boot and a login prompt on the board's
+                      serial console (EDL boards).
+      --root-password Ask for a root password and set it in the image, to log
+                      in on the serial console (EDL boards).
       --cache DIR     Keep downloads and work files in DIR (needs ~15 GB free
                       for the biggest images). Default: ~/.cache/vflasher.
       --download-only Download and verify the image, but do not flash.
@@ -748,6 +752,63 @@ check_unpack_space() { # IMAGE WORK
     fi
 }
 
+# --boot-log: show the boot on the serial console. Removes rhgb/quiet from the
+# boot entries and adds earlycon plus the board's serial console (the last
+# console= is where systemd starts the login prompt). Fedora's kernel-install
+# copies the running command line, so later kernels keep it.
+enable_boot_log() { # WORK BOOT_IMAGE CONSOLE
+    local work="$1" mnt="$1/mnt-bootlog" e
+    need mount; need umount
+    mkdir -p "$mnt"
+    mount -o loop "$2" "$mnt" || die "could not mount the image's /boot"
+    for e in "$mnt"/loader/entries/*.conf; do
+        [ -f "$e" ] || continue
+        awk -v add="earlycon console=tty0 console=$3" '
+            $1 == "options" {
+                out = "options"
+                for (i = 2; i <= NF; i++)
+                    if ($i != "rhgb" && $i != "quiet" && $i != "earlycon" && $i !~ /^console=/) out = out " " $i
+                $0 = out " " add
+            }
+            { print }' "$e" > "$work/entry.new" && cat "$work/entry.new" > "$e"
+    done
+    umount "$mnt"
+}
+
+# --root-password: set root's password (a SHA-512 crypt hash) in the image's
+# /etc/shadow, so you can log in on the serial console.
+set_root_password() { # WORK ROOT_IMAGE HASH
+    local work="$1" mnt="$1/mnt-shadow" fs off fsize _u _l _s l shadow opts=()
+    read -r fs off fsize _u _l _s < <(py_helper find-fs "$2")
+    case "$fs" in
+        btrfs) opts=(-o subvolid=5) ;;
+        xfs) opts=(-o nouuid) ;;
+        ext4) ;;
+        *) die "cannot set the root password on a '${fs:-unknown}' file system" ;;
+    esac
+    mkdir -p "$mnt"
+    l="$(losetup -f --show -o "$off" --sizelimit "$fsize" "$2")"
+    mount "${opts[@]}" "$l" "$mnt" || { losetup -d "$l"; die "could not mount the image's root file system"; }
+    shadow="$(find "$mnt" -maxdepth 3 -path '*/etc/shadow' -type f | head -n1)"
+    if [ -z "$shadow" ]; then umount "$mnt"; losetup -d "$l"; die "no /etc/shadow in the image"; fi
+    HASH="$3" awk -F: -v OFS=: '$1 == "root" { $2 = ENVIRON["HASH"]; $3 = "" } { print }' "$shadow" > "$work/shadow.new" \
+        && cat "$work/shadow.new" > "$shadow"
+    rm -f "$work/shadow.new"
+    umount "$mnt"; losetup -d "$l"
+}
+
+ask_root_password() { # -> prints the hash
+    local p1="${VFLASHER_ROOT_PASSWORD:-}" p2
+    need openssl
+    if [ -z "$p1" ]; then
+        read -r -s -p "Root password for the board: " p1 < /dev/tty; echo > /dev/tty
+        read -r -s -p "Again: " p2 < /dev/tty; echo > /dev/tty
+        [ "$p1" = "$p2" ] || die "the passwords do not match"
+    fi
+    [ -n "$p1" ] || die "empty root password"
+    printf '%s' "$p1" | openssl passwd -6 -stdin
+}
+
 # Undo mounts and loop devices of a work folder, then delete it.
 qdl_cleanup() {
     local work="$1" m f
@@ -865,7 +926,7 @@ rebuild_for_sector_size() { # WORK SS
 }
 
 flash_qdl() {
-    local image="$1" assume_yes="$2"
+    local image="$1" assume_yes="$2" boot_log="${3:-0}" root_pw="${4:-0}"
     local storage="${CONF[QDL_STORAGE]:-emmc}" esp_name="${CONF[QDL_ESP_PARTITION]:-efi}"
     local root_name="${CONF[QDL_ROOT_PARTITION]:-system}"
     local layout="${CONF[QDL_LAYOUT]:-keep-firmware}" ss="${CONF[QDL_SECTOR_SIZE]:-512}" lun="${CONF[QDL_LUN]:-0}"
@@ -881,6 +942,14 @@ flash_qdl() {
     need python3; need awk; need stat
     [ "$QDL" != qdl ] || need qdl
     [ "${VFLASHER_TEST:-}" = 1 ] || [ -d /sys/bus/usb/devices ] || die "cannot see USB devices (/sys/bus/usb)"
+
+    local pw_hash=""
+    if [ "$root_pw" -eq 1 ]; then
+        pw_hash="$(ask_root_password)" || exit 1
+    fi
+    if [ "$boot_log" -eq 1 ] && [ -z "${CONF[SERIAL_CONSOLE]:-}" ]; then
+        die "--boot-log: this board's manifest names no SERIAL_CONSOLE"
+    fi
 
     local prog; prog="$(fetch_programmer)"
 
@@ -922,6 +991,14 @@ flash_qdl() {
     if [ -n "${CONF[DTB]:-}" ]; then
         info "Setting the device tree to ${CONF[DTB]}"
         add_devicetree_to_esp "$work/p1.img" "${CONF[DTB]}"
+    fi
+    if [ "$boot_log" -eq 1 ]; then
+        info "Showing the boot on the serial console (${CONF[SERIAL_CONSOLE]})"
+        enable_boot_log "$work" "$work/p2.img" "${CONF[SERIAL_CONSOLE]}"
+    fi
+    if [ -n "$pw_hash" ]; then
+        info "Setting the root password"
+        set_root_password "$work" "$work/p3.img" "$pw_hash"
     fi
 
     echo
@@ -1013,7 +1090,7 @@ flash_qdl() {
 # -------------------------------------------------------------------- main
 
 main() {
-    local device="" assume_yes=0 download_only=0 info_only=0
+    local device="" assume_yes=0 download_only=0 info_only=0 boot_log=0 root_pw=0
     local -a pos=()
 
     while [ $# -gt 0 ]; do
@@ -1025,6 +1102,8 @@ main() {
             --device=*)      device="${1#*=}" ;;
             -y|--yes)        assume_yes=1 ;;
             --download-only) download_only=1 ;;
+            --boot-log)      boot_log=1 ;;
+            --root-password) root_pw=1 ;;
             --cache)         [ $# -ge 2 ] || die "$1 needs an argument"; VFLASHER_CACHE="$(realpath -m "$2")"; shift ;;
             --cache=*)       VFLASHER_CACHE="$(realpath -m "${1#*=}")" ;;
             --info)          info_only=1 ;;
@@ -1074,7 +1153,7 @@ main() {
     fi
 
     if [ "$method" = qdl ]; then
-        flash_qdl "$image" "$assume_yes"
+        flash_qdl "$image" "$assume_yes" "$boot_log" "$root_pw"
         return
     fi
 

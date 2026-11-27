@@ -98,8 +98,16 @@ chip's boot ROM, so the board can always be reflashed.
   table checks clean with `sgdisk -v`, and all three partitions mount from a
   4K-sector device with the expected UUIDs and contents. CI repeats this on a
   small image (`tests/test-ufs-flash.sh`).
-- If the screen stays dark, log in on the serial console (115200 8N1) and send
-  `journalctl -b -k | grep -i -E 'msm|drm|dp'`.
+- If the screen stays dark, flash again with `--boot-log --root-password`:
+
+  ```bash
+  sudo ./vflasher qualcomm iq9075-evk fedora-workstation --boot-log --root-password
+  ```
+
+  The whole boot then shows on the main serial console (`ttyMSM0`, 115200 8N1;
+  of the debug port's channels, the one that prints UEFI and then Linux, not
+  the `sail_proc@home$` one), ending in a `login:` prompt. Log in as `root` and
+  run `dmesg | grep -i -E 'msm|drm|dp|gpu|firmware'`.
 - Only the two mini DP ports are enabled for display in the upstream device
   tree, so use one of those.
 - Windows can't flash this board: rebuilding the EFI partition for 4K sectors

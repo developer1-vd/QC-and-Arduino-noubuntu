@@ -51,7 +51,7 @@ printf 'BOOTAA64' > "$t/src/shim"; mcopy -i "$t/src/esp.img" "$t/src/shim" ::/EF
 mkdir -p "$t/bootdir/loader/entries" "$t/bootdir/grub2" "$t/bootdir/dtb-1.0/qcom"
 ln -s dtb-1.0 "$t/bootdir/dtb"
 echo dtb > "$t/bootdir/dtb-1.0/qcom/test-board.dtb"
-printf 'title Fedora\nlinux /vmlinuz\noptions root=/dev/mapper/systemVG-LVRoot ro rd.lvm.lv=systemVG/LVRoot\n' > "$t/bootdir/loader/entries/a.conf"
+printf 'title Fedora\nlinux /vmlinuz\noptions root=/dev/mapper/systemVG-LVRoot ro rd.lvm.lv=systemVG/LVRoot rhgb quiet\n' > "$t/bootdir/loader/entries/a.conf"
 # shellcheck disable=SC2016  # GRUB variables, not shell
 printf 'if [ -z "${kernelopts}" ]; then\n  set kernelopts="root=/dev/mapper/systemVG-LVRoot ro  "\nfi\nset root=hd0\n' > "$t/bootdir/grub2/grub.cfg"
 truncate -s 64M "$t/src/boot.img"
@@ -80,6 +80,7 @@ btrfs subvolume create "$mnt/root" > /dev/null
 mkdir -p "$mnt/root/etc"
 printf 'UUID=%s / btrfs compress=zstd:1,defaults,subvol=root 0 1\n' "$ROOT_UUID" > "$mnt/root/etc/fstab"
 echo kept > "$mnt/root/etc/marker"
+printf 'root:!locked::0:99999:7:::\nbin:*:20000:0:99999:7:::\n' > "$mnt/root/etc/shadow"
 umount "$mnt"
 
 python3 -I - "$t/src" root fedora.raw <<'PY'
@@ -151,6 +152,7 @@ QDL_PROGRAMMER_FORMAT=tar.gz
 QDL_PROGRAMMER_PATH=fw/prog_firehose_ddr.elf
 QDL_PROGRAMMER_SHA256=$(sha256sum "$t/bundle/fw/prog_firehose_ddr.elf" | cut -d' ' -f1)
 DTB=qcom/test-board.dtb
+SERIAL_CONSOLE=ttyMSM0,115200n8
 EOF
 
 run_vflasher() {
@@ -190,7 +192,7 @@ ok "EFI partition: 4096-byte sectors, serial kept, files copied, device tree set
 
 B="$(loop -r -b 4096 -o $(( $(start 2) * 4096 )) "$t/lun0.img")"
 mount -o ro "$B" "$mnt"
-grep -q "options root=UUID=$ROOT_UUID ro\$" "$mnt/loader/entries/a.conf" || bad "BLS entry: $(cat "$mnt/loader/entries/a.conf")"
+grep -q "options root=UUID=$ROOT_UUID ro rhgb quiet\$" "$mnt/loader/entries/a.conf" || bad "BLS entry: $(cat "$mnt/loader/entries/a.conf")"
 grep -q "kernelopts=\"root=UUID=$ROOT_UUID ro  \"" "$mnt/grub2/grub.cfg" || bad "grub.cfg fallback not updated"
 grep -q '^set root=hd0$' "$mnt/grub2/grub.cfg" || bad "grub.cfg 'set root' was changed"
 umount "$mnt"
@@ -226,7 +228,8 @@ sed -e "s#fedora.raw.xz#workstation.raw.xz#g" \
 make_lun normal
 VFLASHER_TEST=1 VFLASHER_IMAGES="$t/images" VFLASHER_CACHE="$t/cache" \
     VFLASHER_QDL="$here/fake-qdl" FAKE_QDL_DISK="$t/lun0.img" FAKE_QDL_LOG="$t/qdl.log" \
-    "$repo/vflasher" test ufs workstation --yes > "$t/out-ws.txt" 2>&1 || { cat "$t/out-ws.txt"; bad "btrfs flash failed"; }
+    VFLASHER_ROOT_PASSWORD=s3cret "$repo/vflasher" test ufs workstation --yes --boot-log --root-password \
+    > "$t/out-ws.txt" 2>&1 || { cat "$t/out-ws.txt"; bad "btrfs flash failed"; }
 grep -q 'btrfs root file system already works with 4096-byte sectors' "$t/out-ws.txt" || bad "btrfs root was not kept"
 L="$(loop -r -b 4096 "$t/lun0.img")"
 R="$(loop -r -b 4096 -o $(( $(start 3) * 4096 )) "$t/lun0.img")"
@@ -234,8 +237,20 @@ mount -o ro,subvolid=5 "$R" "$mnt" || bad "btrfs root does not mount from a 4K-s
 [ "$(cat "$mnt/root/etc/marker")" = kept ] || bad "btrfs contents changed"
 grep -q "^UUID=$ROOT_UUID / btrfs compress=zstd:1,defaults,x-systemd.growfs,subvol=root 0 1\$\|^UUID=$ROOT_UUID / btrfs compress=zstd:1,defaults,subvol=root,x-systemd.growfs 0 1\$" "$mnt/root/etc/fstab" \
     || bad "fstab: $(cat "$mnt/root/etc/fstab")"
+hash="$(awk -F: '$1 == "root" { print $2 }' "$mnt/root/etc/shadow")"
+salt="$(cut -d'$' -f3 <<<"$hash")"
+[ "$(openssl passwd -6 -salt "$salt" s3cret)" = "$hash" ] || bad "root password not set: $hash"
+grep -q '^bin:\*:20000:' "$mnt/root/etc/shadow" || bad "other shadow lines changed"
 umount "$mnt"
 ok "btrfs root (Fedora Workstation) is kept, mounts from a 4K device, and grows on first boot"
+ok "--root-password sets root's password (SHA-512) and leaves other accounts alone"
+B="$(loop -r -b 4096 -o $(( $(start 2) * 4096 )) "$t/lun0.img")"
+mount -o ro "$B" "$mnt"
+opts="$(grep '^options' "$mnt/loader/entries/a.conf")"
+umount "$mnt"
+[[ $opts == *" earlycon console=tty0 console=ttyMSM0,115200n8" && $opts != *rhgb* && $opts != *quiet* ]] \
+    || bad "--boot-log options: $opts"
+ok "--boot-log drops rhgb/quiet and sends the boot to the serial console"
 
 # Too little space for unpacking: a clear error, nothing written, nothing left.
 mkdir -p "$t/small"
