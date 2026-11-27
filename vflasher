@@ -23,8 +23,8 @@ Usage:
   vflasher --list
 
 Examples:
-  sudo vflasher qualcomm iq9075-evk fedora
-  sudo vflasher qualcomm iq9075-evk fedora --device /dev/sdb
+  sudo vflasher qualcomm iq9075-evk fedora-workstation
+  sudo vflasher qualcomm iq9075-evk fedora-workstation --cache /mnt/big/vflasher
   sudo vflasher arduino ventuno-q fedora
 
 Options:

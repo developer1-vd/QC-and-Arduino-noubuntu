@@ -56,7 +56,7 @@ Linux tools, so use the Linux `vflasher` script for it.
 You can also preselect the image from a terminal, like on Linux:
 
 ```
-vflasher qualcomm iq9075-evk fedora
+vflasher arduino ventuno-q fedora
 ```
 
 Downloads are cached in `%LOCALAPPDATA%\VFlasher\cache`, and a dropped download

@@ -379,7 +379,7 @@ public class LayoutTests
     public async Task WindowsRefusesWholeLunImages()
     {
         var images = ManifestCatalog.LoadLocal(ManifestCatalog.FindLocalImagesDir(AppContext.BaseDirectory)!);
-        var iq9 = images.Single(m => m.Id == "qualcomm/iq9075-evk/fedora");
+        var iq9 = images.Single(m => m.Id == "qualcomm/iq9075-evk/fedora-workstation");
         var ventuno = images.Single(m => m.Id == "arduino/ventuno-q/fedora");
         Assert.False(QdlFlashJob.SupportsLayout(iq9));
         Assert.True(QdlFlashJob.SupportsLayout(ventuno));

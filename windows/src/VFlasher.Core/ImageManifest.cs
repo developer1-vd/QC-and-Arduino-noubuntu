@@ -37,7 +37,7 @@ public sealed partial class ImageManifest
     public string? OsVersion => Get("OS_VERSION");
     public string? Dtb => Get("DTB");
 
-    /// <summary>"qualcomm/iq9075-evk/fedora"</summary>
+    /// <summary>"arduino/ventuno-q/fedora"</summary>
     public string Id => $"{Manufacturer}/{Board}/{Os}";
 
     public string? Get(string key) => values.TryGetValue(key, out var v) ? v : null;
