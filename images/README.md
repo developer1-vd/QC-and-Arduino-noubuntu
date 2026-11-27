@@ -21,6 +21,7 @@ VFlasher downloads the image, checks it, and refuses to flash on a mismatch.
 | Manufacturer | Board | OS | Version |
 |---|---|---|---|
 | qualcomm | [iq9075-evk](qualcomm/iq9075-evk/fedora/) | fedora | 45 |
+| qualcomm | [iq9075-evk](qualcomm/iq9075-evk/fedora-workstation/) | fedora-workstation (GNOME) | 45 |
 | arduino | [ventuno-q](arduino/ventuno-q/fedora/) | fedora | 45 |
 
 Every image also needs a line in [`index.txt`](index.txt), which the Windows app

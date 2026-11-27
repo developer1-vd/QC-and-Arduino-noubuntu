@@ -33,7 +33,7 @@ jobs:
       - name: EDL/qdl flashing test (fake board, jobs checked by real qdl)
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq gdisk mtools zstd dosfstools xfsprogs attr
+          sudo apt-get install -y -qq gdisk mtools zstd dosfstools xfsprogs btrfs-progs attr
           tests/test-qdl-flash.sh
       # Mounts file systems, so it runs as root.
       - name: 4K-sector UFS flashing test (IQ-9075 layout, jobs checked by real qdl)

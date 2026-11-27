@@ -28,7 +28,7 @@ ok() { printf 'ok   %s\n' "$*"; pass=$((pass + 1)); }
 bad() { printf 'FAIL %s\n' "$*" >&2; exit 1; }
 loop() { local l; l="$(losetup -f --show "$@")"; loops+=("$l"); echo "$l"; }
 
-for tool in python3 sgdisk mformat mcopy mtype minfo mkfs.vfat mkfs.xfs mkfs.ext4 setfattr getfattr xz curl; do
+for tool in python3 sgdisk mformat mcopy mtype minfo mkfs.vfat mkfs.xfs mkfs.ext4 mkfs.btrfs setfattr getfattr xz curl; do
     command -v "$tool" >/dev/null || bad "missing tool: $tool"
 done
 
@@ -72,11 +72,21 @@ sha_tool="$(sha256sum < "$mnt/usr/bin/tool")"
 umount "$mnt"
 { printf 'LABELONE'; head -c $((1024 * 1024 - 8)) /dev/zero; cat "$t/src/xfs.img"; } > "$t/src/root.img"
 
-python3 -I - "$t/src" <<'PY'
+# Like Fedora Workstation: a btrfs root (4 KiB sectors) with a "root" subvolume.
+truncate -s 160M "$t/src/btrfs.img"
+mkfs.btrfs -q -s 4096 -U "$ROOT_UUID" -L fedora "$t/src/btrfs.img"
+mount -o loop "$t/src/btrfs.img" "$mnt"
+btrfs subvolume create "$mnt/root" > /dev/null
+mkdir -p "$mnt/root/etc"
+printf 'UUID=%s / btrfs compress=zstd:1,defaults,subvol=root 0 1\n' "$ROOT_UUID" > "$mnt/root/etc/fstab"
+echo kept > "$mnt/root/etc/marker"
+umount "$mnt"
+
+python3 -I - "$t/src" root fedora.raw <<'PY'
 import struct, sys
-d = sys.argv[1]
+d, root_name, out = sys.argv[1:4]
 S = 512
-parts = [open(f"{d}/{n}.img", "rb").read() for n in ("esp", "boot", "root")]
+parts = [open(f"{d}/{n}.img", "rb").read() for n in ("esp", "boot", root_name)]
 start, starts = 2048, []
 for p in parts:
     starts.append(start)
@@ -86,9 +96,26 @@ for i, (s, p) in enumerate(zip(starts, parts)):
     struct.pack_into("<B3xB3xII", img, 446 + 16 * i, 0, 0xEF if i == 0 else 0x83, s, len(p) // S)
     img[s * S: s * S + len(p)] = p
 img[510:512] = b"\x55\xaa"
-open(f"{d}/fedora.raw", "wb").write(img)
+open(f"{d}/{out}", "wb").write(img)
 PY
 xz -T0 -k "$t/src/fedora.raw"
+python3 -I - "$t/src" btrfs workstation.raw <<'PY'
+import struct, sys
+d, root_name, out = sys.argv[1:4]
+S = 512
+parts = [open(f"{d}/{n}.img", "rb").read() for n in ("esp", "boot", root_name)]
+start, starts = 2048, []
+for p in parts:
+    starts.append(start)
+    start += (len(p) + 1048575) // 1048576 * 2048
+img = bytearray(start * S)
+for i, (s, p) in enumerate(zip(starts, parts)):
+    struct.pack_into("<B3xB3xII", img, 446 + 16 * i, 0, 0xEF if i == 0 else 0x83, s, len(p) // S)
+    img[s * S: s * S + len(p)] = p
+img[510:512] = b"\x55\xaa"
+open(f"{d}/{out}", "wb").write(img)
+PY
+xz -T0 -k "$t/src/workstation.raw"
 
 mkdir -p "$t/bundle/fw"
 head -c 900000 /dev/urandom > "$t/bundle/fw/prog_firehose_ddr.elf"
@@ -189,6 +216,26 @@ ok "qdl: 6 sectors read from LUN 0, primary GPT written last"
 if [ -n "${REAL_QDL:-}" ]; then
     ok "every qdl job was also accepted by the real qdl ($REAL_QDL --dry-run)"
 fi
+
+# A btrfs root (Fedora Workstation) already works with 4K sectors: it is kept,
+# and fstab gets x-systemd.growfs so it fills the LUN.
+mkdir -p "$t/images/test/ufs/workstation"
+sed -e "s#fedora.raw.xz#workstation.raw.xz#g" \
+    -e "s#^IMAGE_SHA256=.*#IMAGE_SHA256=$(sha256sum "$t/src/workstation.raw.xz" | cut -d' ' -f1)#" \
+    "$t/images/test/ufs/fedora/image.conf" > "$t/images/test/ufs/workstation/image.conf"
+make_lun normal
+VFLASHER_TEST=1 VFLASHER_IMAGES="$t/images" VFLASHER_CACHE="$t/cache" \
+    VFLASHER_QDL="$here/fake-qdl" FAKE_QDL_DISK="$t/lun0.img" FAKE_QDL_LOG="$t/qdl.log" \
+    "$repo/vflasher" test ufs workstation --yes > "$t/out-ws.txt" 2>&1 || { cat "$t/out-ws.txt"; bad "btrfs flash failed"; }
+grep -q 'btrfs root file system already works with 4096-byte sectors' "$t/out-ws.txt" || bad "btrfs root was not kept"
+L="$(loop -r -b 4096 "$t/lun0.img")"
+R="$(loop -r -b 4096 -o $(( $(start 3) * 4096 )) "$t/lun0.img")"
+mount -o ro,subvolid=5 "$R" "$mnt" || bad "btrfs root does not mount from a 4K-sector device"
+[ "$(cat "$mnt/root/etc/marker")" = kept ] || bad "btrfs contents changed"
+grep -q "^UUID=$ROOT_UUID / btrfs compress=zstd:1,defaults,x-systemd.growfs,subvol=root 0 1\$\|^UUID=$ROOT_UUID / btrfs compress=zstd:1,defaults,subvol=root,x-systemd.growfs 0 1\$" "$mnt/root/etc/fstab" \
+    || bad "fstab: $(cat "$mnt/root/etc/fstab")"
+umount "$mnt"
+ok "btrfs root (Fedora Workstation) is kept, mounts from a 4K device, and grows on first boot"
 
 make_lun firmware
 cp "$t/lun0.img" "$t/lun0-before.img"

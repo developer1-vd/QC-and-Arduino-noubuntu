@@ -272,7 +272,8 @@ QDL="${VFLASHER_QDL:-qdl}"
 #                       a fresh GPT for a whole LUN (efi, boot, system), sized
 #                       from the LUN's current GPT header; prints KEY VALUE lines
 #   find-fs FILE        locate the file system inside a partition (e.g. in an
-#                       LVM volume); prints "TYPE OFFSET BYTES UUID LABEL"
+#                       LVM volume); prints "TYPE OFFSET BYTES UUID LABEL
+#                       SECTOR" (XFS/btrfs sector size, ext4 block size)
 read -r -d '' PY_HELPER <<'PY' || true
 import re, struct, sys, uuid, zlib
 
@@ -446,13 +447,22 @@ def find_fs(path):
                 bsize = struct.unpack_from(">I", sb, 4)[0]
                 dblocks = struct.unpack_from(">Q", sb, 8)[0]
                 label = sb[108:120].rstrip(b"\0").decode(errors="replace") or "-"
-                print("xfs", off, bsize * dblocks, uuid.UUID(bytes=sb[32:48]), label)
+                sectsz = struct.unpack_from(">H", sb, 102)[0]
+                print("xfs", off, bsize * dblocks, uuid.UUID(bytes=sb[32:48]), label, sectsz)
                 return
             if struct.unpack_from("<H", sb, 1024 + 56)[0] == 0xEF53:
                 blocks = struct.unpack_from("<I", sb, 1024 + 4)[0]
                 bsize = 1024 << struct.unpack_from("<I", sb, 1024 + 24)[0]
                 label = sb[1024 + 120:1024 + 136].rstrip(b"\0").decode(errors="replace") or "-"
-                print("ext4", off, blocks * bsize, uuid.UUID(bytes=sb[1024 + 104:1024 + 120]), label)
+                print("ext4", off, blocks * bsize, uuid.UUID(bytes=sb[1024 + 104:1024 + 120]), label, bsize)
+                return
+            f.seek(off + 0x10000)
+            bt = f.read(0x1000)
+            if bt[0x40:0x48] == b"_BHRfS_M":
+                total = struct.unpack_from("<Q", bt, 0x70)[0]
+                sectsz = struct.unpack_from("<I", bt, 0x90)[0]
+                label = bt[0x12B:0x12B + 256].split(b"\0")[0].decode(errors="replace") or "-"
+                print("btrfs", off, total, uuid.UUID(bytes=bt[0x20:0x30]), label.replace(" ", "_"), sectsz)
                 return
     fail(f"no file system found in {path}")
 
@@ -730,6 +740,23 @@ rewrite_file() { # FILE SED_SCRIPT
     sed -E "$2" "$1" > "$1.vflasher-tmp" && cat "$1.vflasher-tmp" > "$1" && rm -f "$1.vflasher-tmp"
 }
 
+# Add x-systemd.growfs to the root entry in a root file system's fstab, so a
+# root kept as is also grows to fill its partition on first boot.
+enable_growfs() { # WORK IMAGE OFFSET BYTES FSTYPE
+    local work="$1" mnt="$1/mnt-root" l fstab opts=()
+    mkdir -p "$mnt"
+    l="$(losetup -f --show -o "$3" --sizelimit "$4" "$2")"
+    [ "$5" = btrfs ] && opts=(-o subvolid=5)
+    [ "$5" = xfs ] && opts=(-o nouuid)
+    mount "${opts[@]}" "$l" "$mnt" || { losetup -d "$l"; die "could not mount the image's root file system"; }
+    fstab="$(find "$mnt" -maxdepth 3 -path '*/etc/fstab' -type f | head -n1)"
+    if [ -n "$fstab" ]; then
+        awk '$1 !~ /^#/ && $2 == "/" && $4 !~ /x-systemd\.growfs/ { $4 = $4 ",x-systemd.growfs" } { print }' \
+            "$fstab" > "$work/fstab.new" && cat "$work/fstab.new" > "$fstab"
+    fi
+    umount "$mnt"; losetup -d "$l"
+}
+
 # Rebuild the image's partitions for storage with SS-byte sectors (UFS uses
 # 4096). FAT and XFS made for 512-byte sectors cannot be mounted on such a
 # device; ext4 with 4K blocks works as is. Root on LVM becomes a plain XFS
@@ -760,11 +787,24 @@ rebuild_for_sector_size() { # WORK SS
     MTOOLS_SKIP_CHECK=1 mcopy -s -i "$work/p1.img" "$work/esp-files/"* ::/
     rm -rf "$work/esp-files"
 
-    info "Rebuilding the root file system for ${ss}-byte sectors"
-    local fs off fsize uuid fslabel
-    read -r fs off fsize uuid fslabel < <(py_helper find-fs "$work/p3.img")
-    [ "$fs" = xfs ] || die "unsupported root file system '${fs:-none}' (expected XFS)"
+    local fs off fsize uuid fslabel fsec
+    read -r fs off fsize uuid fslabel fsec < <(py_helper find-fs "$work/p3.img")
     [ "$fslabel" = - ] && fslabel=""
+    case "$fs" in
+        xfs) ;;
+        ext4|btrfs)
+            [ "${fsec:-0}" -ge "$ss" ] || die "the image's $fs root uses ${fsec}-byte blocks; this storage needs $ss"
+            info "The $fs root file system already works with ${ss}-byte sectors"
+            enable_growfs "$work" "$work/p3.img" "$off" "$fsize" "$fs"
+            return ;;
+        *) die "unsupported root file system '${fs:-none}'" ;;
+    esac
+    if [ "${fsec:-0}" -ge "$ss" ]; then
+        info "The XFS root file system already works with ${ss}-byte sectors"
+        enable_growfs "$work" "$work/p3.img" "$off" "$fsize" xfs
+        return
+    fi
+    info "Rebuilding the root file system for ${ss}-byte sectors"
     local old
     old="$(losetup -f --show -r -o "$off" --sizelimit "$fsize" "$work/p3.img")"
     # nouuid: the old and new file system share a UUID while both are mounted.
