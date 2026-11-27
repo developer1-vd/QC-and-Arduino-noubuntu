@@ -357,6 +357,10 @@ def split(outdir):
                 left -= len(b)
             out.truncate(length)
         print(f"p{i} {start} {sectors}")
+    # Read to the end (e.g. the backup GPT after the last partition), so the
+    # decompressor feeding stdin finishes instead of dying of a broken pipe.
+    while sys.stdin.buffer.read(MIB):
+        pass
 
 
 def crc(b):
@@ -891,10 +895,19 @@ flash_qdl() {
     local name sectors
     # shellcheck disable=SC2086
     check_unpack_space "$image" "$work"
+    local unpack_status split_status
+    set +e
     # shellcheck disable=SC2086
-    if ! $unpack "$image" | py_helper split "$work" > "$work/parts.txt"; then
+    $unpack "$image" | py_helper split "$work" > "$work/parts.txt"
+    unpack_status=${PIPESTATUS[0]} split_status=${PIPESTATUS[1]}
+    set -e
+    if [ "$split_status" -ne 0 ]; then
         rm -f "$work"/p*.img
-        die "could not unpack the image (see the error above). Free some space, or use --cache DIR on a bigger drive."
+        die "could not split the image into partitions (see the error above)"
+    fi
+    if [ "$unpack_status" -ne 0 ]; then
+        rm -f "$work"/p*.img
+        die "decompressing the image failed (exit code $unpack_status); delete $image and run VFlasher again to re-download it"
     fi
     while read -r name _ sectors; do
         parts+=("$name:$sectors")

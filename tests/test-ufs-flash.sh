@@ -91,7 +91,7 @@ start, starts = 2048, []
 for p in parts:
     starts.append(start)
     start += (len(p) + 1048575) // 1048576 * 2048
-img = bytearray(start * S)
+img = bytearray(start * S + (1 << 20))  # 1 MiB after the last partition, like real images
 for i, (s, p) in enumerate(zip(starts, parts)):
     struct.pack_into("<B3xB3xII", img, 446 + 16 * i, 0, 0xEF if i == 0 else 0x83, s, len(p) // S)
     img[s * S: s * S + len(p)] = p
@@ -108,7 +108,7 @@ start, starts = 2048, []
 for p in parts:
     starts.append(start)
     start += (len(p) + 1048575) // 1048576 * 2048
-img = bytearray(start * S)
+img = bytearray(start * S + (1 << 20))  # 1 MiB after the last partition, like real images
 for i, (s, p) in enumerate(zip(starts, parts)):
     struct.pack_into("<B3xB3xII", img, 446 + 16 * i, 0, 0xEF if i == 0 else 0x83, s, len(p) // S)
     img[s * S: s * S + len(p)] = p

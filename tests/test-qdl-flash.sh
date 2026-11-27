@@ -41,7 +41,8 @@ boot = (b"BOOT" * 128) * (24 * 2048)          # 24 MiB
 root = bytearray((b"ROOT" * 128) * (64 * 2048))  # 64 MiB, with a zero hole
 root[8 << 20: 24 << 20] = bytes(16 << 20)
 parts = [(2048, esp), (2048 + len(esp) // S, boot), (2048 + (len(esp) + len(boot)) // S, bytes(root))]
-total = parts[-1][0] * S + len(root)
+# 1 MiB after the last partition, like real images (backup GPT, slack).
+total = parts[-1][0] * S + len(root) + (1 << 20)
 img = bytearray(total)
 for i, (start, data) in enumerate(parts):
     t = 0xEF if i == 0 else 0x83
