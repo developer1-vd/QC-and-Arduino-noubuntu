@@ -237,6 +237,25 @@ grep -q "^UUID=$ROOT_UUID / btrfs compress=zstd:1,defaults,x-systemd.growfs,subv
 umount "$mnt"
 ok "btrfs root (Fedora Workstation) is kept, mounts from a 4K device, and grows on first boot"
 
+# Too little space for unpacking: a clear error, nothing written, nothing left.
+mkdir -p "$t/small"
+mount -t tmpfs -o size=12M tmpfs "$t/small"
+make_lun normal
+cp "$t/lun0.img" "$t/lun0-before.img"
+if VFLASHER_TEST=1 VFLASHER_IMAGES="$t/images" VFLASHER_QDL="$here/fake-qdl" FAKE_QDL_DISK="$t/lun0.img" \
+    "$repo/vflasher" test ufs fedora --yes --cache "$t/small" > "$t/out-space.txt" 2>&1; then
+    umount "$t/small"; bad "unpacking into 12 MB should fail"
+fi
+left="$(find "$t/small" -name 'work.*' | wc -l)"
+umount "$t/small"
+if ! grep -q 'ran out of disk space' "$t/out-space.txt" || ! grep -q 'use --cache DIR' "$t/out-space.txt"; then
+    bad "unclear error: $(tail -4 "$t/out-space.txt")"
+fi
+if grep -q 'expected an image with' "$t/out-space.txt"; then bad "misleading partition-count error shown"; fi
+[ "$left" = 0 ] || bad "work folder left behind"
+cmp -s "$t/lun0.img" "$t/lun0-before.img" || bad "LUN changed although unpacking failed"
+ok "out of disk space while unpacking: clear error, --cache suggested, nothing written or left behind"
+
 make_lun firmware
 cp "$t/lun0.img" "$t/lun0-before.img"
 if run_vflasher > "$t/out2.txt" 2>&1; then bad "a LUN holding firmware must be refused"; fi

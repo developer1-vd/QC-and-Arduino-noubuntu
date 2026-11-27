@@ -32,6 +32,8 @@ Options:
                       If omitted, VFlasher lists drives and asks.
                       Not used for boards flashed over USB in EDL mode.
   -y, --yes           Do not ask for confirmation before writing.
+      --cache DIR     Keep downloads and work files in DIR (needs ~15 GB free
+                      for the biggest images). Default: ~/.cache/vflasher.
       --download-only Download and verify the image, but do not flash.
       --info          Show the image details and exit.
   -l, --list          List available images and exit.
@@ -559,7 +561,12 @@ def plan(gpt_file, esp_name, root_name, boot_sectors, esp_min, root_min, root_ty
 
 
 if sys.argv[1] == "split":
-    split(sys.argv[2])
+    try:
+        split(sys.argv[2])
+    except OSError as e:
+        if e.errno == 28:  # ENOSPC
+            fail(f"ran out of disk space in {sys.argv[2]} while unpacking the image")
+        raise
 elif sys.argv[1] == "plan":
     plan(*sys.argv[2:10])
 elif sys.argv[1] == "lun-plan":
@@ -721,6 +728,22 @@ qdl_program_line() { # DIR LABEL FILE START [SECTOR_SIZE] [LUN]
     printf '  <program SECTOR_SIZE_IN_BYTES="%s" file_sector_offset="0" filename="%s" label="%s" num_partition_sectors="%s" physical_partition_number="%s" sparse="false" start_sector="%s"/>\n' "$ss" "$3" "$2" "$sectors" "${6:-0}" "$4"
 }
 
+# Warn early if the work folder's drive may be too small to unpack the image.
+check_unpack_space() { # IMAGE WORK
+    local need="" avail
+    if [ "${CONF[IMAGE_FORMAT]}" = raw.xz ] && command -v xz > /dev/null; then
+        need="$(xz --robot -l "$1" 2> /dev/null | awk '$1 == "totals" { print $5 }')"
+    fi
+    avail="$(df -B1 --output=avail "$2" 2> /dev/null | tail -n1 | tr -d ' ')"
+    [[ $need =~ ^[0-9]+$ && $avail =~ ^[0-9]+$ ]] || return 0
+    # The extra 10% covers the rebuilt root file system for 4K-sector storage.
+    if [ "$avail" -lt $(( need + need / 10 )) ]; then
+        warn "unpacking may need up to $(( (need + need / 10) / 1000000000 )) GB in $(dirname "$2"),"
+        warn "which has $(( avail / 1000000000 )) GB free. Empty parts of the image take no space,"
+        warn "so it may still fit; if not, free some space or use --cache DIR on a bigger drive."
+    fi
+}
+
 # Undo mounts and loop devices of a work folder, then delete it.
 qdl_cleanup() {
     local work="$1" m f
@@ -867,9 +890,15 @@ flash_qdl() {
     local -a parts=()
     local name sectors
     # shellcheck disable=SC2086
+    check_unpack_space "$image" "$work"
+    # shellcheck disable=SC2086
+    if ! $unpack "$image" | py_helper split "$work" > "$work/parts.txt"; then
+        rm -f "$work"/p*.img
+        die "could not unpack the image (see the error above). Free some space, or use --cache DIR on a bigger drive."
+    fi
     while read -r name _ sectors; do
         parts+=("$name:$sectors")
-    done < <($unpack "$image" | py_helper split "$work")
+    done < "$work/parts.txt"
     [ ${#parts[@]} -eq 3 ] || die "expected an image with 3 partitions (EFI, /boot, root), found ${#parts[@]}"
     local esp_sectors="${parts[0]#*:}" boot_sectors="${parts[1]#*:}" root_sectors="${parts[2]#*:}"
 
@@ -983,6 +1012,8 @@ main() {
             --device=*)      device="${1#*=}" ;;
             -y|--yes)        assume_yes=1 ;;
             --download-only) download_only=1 ;;
+            --cache)         [ $# -ge 2 ] || die "$1 needs an argument"; VFLASHER_CACHE="$(realpath -m "$2")"; shift ;;
+            --cache=*)       VFLASHER_CACHE="$(realpath -m "${1#*=}")" ;;
             --info)          info_only=1 ;;
             -*)              die "unknown option $1 (see --help)" ;;
             *)               pos+=("$(tr '[:upper:]' '[:lower:]' <<<"$1")") ;;
